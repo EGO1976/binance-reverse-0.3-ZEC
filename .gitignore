@@ -1,6 +1,5 @@
-__pycache__/
-*.pyc
 .env
-.env.*
-secrets.yml
+__pycache__/
+*.log
+.venv/
 
