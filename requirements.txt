@@ -1,6 +1,11 @@
-flask
-requests
-python-binance==1.0.19
-cryptography
+fastapi>=0.100.0
+uvicorn>=0.22.0
+aiohttp>=3.8.0
+websockets>=11.0.3
+requests>=2.31.0
+ujson>=5.8.0
+ccxt>=4.0.0
+python-dotenv
+aiohttp
 
 
