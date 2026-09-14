@@ -46,8 +46,15 @@ TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'\"")
 STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
 # =========================================================================
 
+def get_assets(symbol: str):
+    if symbol.endswith("USDC"):
+        return symbol[:-4], "USDC"
+    elif symbol.endswith("USDT"):
+        return symbol[:-4], "USDT"
+    return symbol, "USDT"
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-logger = logging.getLogger("BTC_USDC_BOT")
+logger = logging.getLogger(f"{SYMBOL}_BOT")
 
 LAST_ERROR_STATE = {"key": None, "sent": False}
 
@@ -99,7 +106,6 @@ def calculate_tp_sl(entry_price: float, side: str, loss_streak: int, tick_size: 
     if entry_price <= 0:
         raise ValueError("Некорректный entry_price")
     
-    # Динамический выбор TP из расписания, с защитой от выхода за границы
     tp_idx = min(max(0, loss_streak), len(TP_SCHEDULE) - 1)
     target_percent = TP_SCHEDULE[tp_idx]
     
@@ -196,6 +202,8 @@ class BinanceMartingaleBot:
         self.rate_limiter = BinanceRateLimiter()
         
         self.active_symbol = SYMBOL
+        self.base_asset, self.quote_asset = get_assets(self.active_symbol)
+        
         self.latest_price = 0.0
         self.last_price_time = 0.0
         self.is_running = True
@@ -353,7 +361,7 @@ class BinanceMartingaleBot:
         res = await self._request("GET", "/fapi/v2/account", signed=True, weight=5)
         if isinstance(res, dict):
             assets = res.get("assets", [])
-            target_asset = "USDC" if "USDC" in self.active_symbol else "USDT"
+            target_asset = self.quote_asset
             for asset in assets:
                 if asset.get("asset") == target_asset:
                     val = float(asset.get("availableBalance", asset.get("maxWithdrawAmount", 0.0)))
@@ -367,7 +375,7 @@ class BinanceMartingaleBot:
                 return root_max_withdraw
         bal_res = await self._request("GET", "/fapi/v2/balance", signed=True, weight=1)
         if isinstance(bal_res, list):
-            target_asset = "USDC" if "USDC" in self.active_symbol else "USDT"
+            target_asset = self.quote_asset
             for b in bal_res:
                 if b.get("asset") == target_asset:
                     return float(b.get("availableBalance", b.get("maxWithdrawAmount", 0.0)))
@@ -447,7 +455,6 @@ class BinanceMartingaleBot:
             "sl_price": sl_numeric
         })
 
-        # Выставляем Стоп-Лосс (STOP_MARKET с closePosition=true)
         sl_client_id = f"sl_{uuid.uuid4().hex[:10]}"
         sl_res = await self._request("POST", "/fapi/v1/algoOrder", {
             "symbol": self.active_symbol,
@@ -466,7 +473,6 @@ class BinanceMartingaleBot:
             self.strategy["sl_algo_id"] = int(sl_res.get("algoId", 0))
             self.strategy["sl_client_algo_id"] = sl_client_id
 
-        # Выставляем Тейк-Профит (LIMIT reduceOnly)
         tp_client_id = f"tp_{uuid.uuid4().hex[:10]}"
         tp_res = await self._request("POST", "/fapi/v1/order", {
             "symbol": self.active_symbol,
@@ -503,21 +509,20 @@ class BinanceMartingaleBot:
                 self.adopted_existing_position = True
                 side = "BUY" if amt > 0 else "SELL"
                 qty = abs(amt)
-                approx_usdc = round(qty * entry_price, 2)
+                approx_quote = round(qty * entry_price, 2)
                 
-                # Автоматическое определение колена по размеру позиции
                 calculated_streak = 0
-                current_target_usdt = USDT_AMOUNT
+                current_target_quote = USDT_AMOUNT
                 for step in range(MAX_STREAK):
-                    if approx_usdc >= current_target_usdt * 0.85:
+                    if approx_quote >= current_target_quote * 0.85:
                         calculated_streak = step
-                    current_target_usdt *= MARTINGALE_MULTIPLIER
+                    current_target_quote *= MARTINGALE_MULTIPLIER
                 
                 loss_streak = min(calculated_streak, MAX_STREAK - 1)
-                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_usdc} USDC")
+                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_quote} {self.quote_asset}")
                 
                 self.strategy.update({
-                    "usdt": max(approx_usdc, USDT_AMOUNT),
+                    "usdt": max(approx_quote, USDT_AMOUNT),
                     "side": side,
                     "entry_price": entry_price,
                     "qty": qty,
@@ -533,7 +538,7 @@ class BinanceMartingaleBot:
                 await send_tg_async(
                     self.session,
                     f"🔄 <b>СИНХРОНИЗАЦИЯ {self.active_symbol}</b>\n"
-                    f"Позиция: <b>{side} {qty} BTC</b> (~{approx_usdc} USDC)\n"
+                    f"Позиция: <b>{side} {qty} {self.base_asset}</b> (~{approx_quote} {self.quote_asset})\n"
                     f"Определено колено: <b>#{current_step}/{MAX_STREAK}</b>\n"
                     f"Вход: {formatted_entry}\n"
                     f"🎯 TP: {tp_price} ({target_percent}%)\n"
@@ -838,19 +843,18 @@ class BinanceMartingaleBot:
             
             if close_type == "TP":
                 current_step = loss_streak + 1
-                msg = f"✅ <b>ТЕЙК-ПРОФИТ!</b>\n"
+                msg = f"✅ <b>ТЕЙК-ПРОФИТ ({self.active_symbol})!</b>\n"
                 msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
                 msg += f"Направление: {side}\n"
                 if pnl_data:
                     sign = "+" if pnl_data["net"] >= 0 else ""
-                    msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} USDC\n"
-                    msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
+                    msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} {self.quote_asset} ({sign}{pnl_data['percent']:.2f}%)\n"
+                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} {self.quote_asset}\n"
+                    msg += f"💳 Баланс: {await self.get_free_margin():.2f} {self.quote_asset}"
                 else:
                     msg += "📊 PnL: данные Binance еще не получены"
                 await send_tg_async(self.session, msg)
                 
-                # Сбрасываем серию до 1-го колена, но СОХРАНЯЕМ успешное направление (side) для продолжения тренда
                 self.strategy.update({
                     "usdt": USDT_AMOUNT,
                     "loss_streak": 0,
@@ -870,8 +874,7 @@ class BinanceMartingaleBot:
             elif close_type == "SL":
                 next_streak = loss_streak + 1
                 if next_streak >= MAX_STREAK:
-                    # Достигнут лимит колен (MAX_STREAK), сбрасываем серию полностью
-                    msg = f"🛑 <b>СТОП-ЛОСС НА МАКСИМАЛЬНОМ КОЛЕНЕ (#{MAX_STREAK})!</b>\n"
+                    msg = f"🛑 <b>СТОП-ЛОСС НА МАКСИМАЛЬНОМ КОЛЕНЕ (#{MAX_STREAK}) [{self.active_symbol}]!</b>\n"
                     msg += f"Достигнут предел серии. Сброс до начального депозита и чистого старта."
                     await send_tg_async(self.session, msg)
                     
@@ -970,9 +973,9 @@ class BinanceMartingaleBot:
 
             await send_tg_async(
                 self.session,
-                f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ!</b>\n"
+                f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ [{self.active_symbol}]!</b>\n"
                 f"{current_side} → {new_side}\n"
-                f"Вход: {formatted_entry} | Объем: {new_qty} BTC (~{next_usdt} USDC)\n"
+                f"Вход: {formatted_entry} | Объем: {new_qty} {self.base_asset} (~{next_usdt} {self.quote_asset})\n"
                 f"🎯 TP: {tp_price} ({target_percent}%) | 🛑 SL: {sl_price} ({STOP_LOSS_PERCENT}%)\n"
                 f"Колено: #{current_step}/{MAX_STREAK}"
             )
@@ -984,6 +987,7 @@ class BinanceMartingaleBot:
     async def start(self):
         self.session = aiohttp.ClientSession()
         self.active_symbol = SYMBOL
+        self.base_asset, self.quote_asset = get_assets(self.active_symbol)
         
         await self.fetch_symbol_info()
         await self.setup_market()
@@ -1016,7 +1020,7 @@ class BinanceMartingaleBot:
                 self.session,
                 f"🤖 <b>БОТ ЗАПУЩЕН</b>\n"
                 f"{self.active_symbol} | Плечо: {LEVERAGE}x\n"
-                f"Старт: {USDT_AMOUNT} USDC | Множитель: {MARTINGALE_MULTIPLIER}x\n"
+                f"Старт: {USDT_AMOUNT} {self.quote_asset} | Множитель: {MARTINGALE_MULTIPLIER}x\n"
                 f"MAX_STREAK: {MAX_STREAK} | SL: {STOP_LOSS_PERCENT}%"
             )
 
@@ -1050,24 +1054,20 @@ class BinanceMartingaleBot:
                     if last_price <= 0:
                         continue
 
-                    # Проверяем TTL продолжения тренда (15 минут)
                     last_tp = self.strategy.get("last_tp_time", 0.0)
                     is_continuation = last_tp > 0 and (time.time() - last_tp < CONTINUATION_TTL_SECONDS)
 
                     atr_percent, candle_color = await self.get_atr_and_candle_color()
 
-                    # Фильтрация по волатильности ATR
                     if atr_percent < MIN_ATR_PERCENT:
                         logger.info(f"⏳ Рынок в затишье (ATR {atr_percent:.3f}% < {MIN_ATR_PERCENT}%). Ожидание...")
                         await asyncio.sleep(10)
                         continue
 
                     if is_continuation:
-                        # Продолжение тренда после TP: направление берется из сохраненного side
                         side = self.strategy.get("side", "BUY")
                         logger.info(f"📈 Продолжение тренда после TP: вход по сохраненному направлению {side}")
                     else:
-                        # Чистый старт или TTL истек: сбрасываем тайм-аут и определяем направление по цвету свечи
                         if last_tp > 0:
                             logger.info("⏳ TTL продолжения тренда истек (> 15 мин). Переход к чистому старту по свече.")
                             self.strategy["last_tp_time"] = 0.0
@@ -1124,8 +1124,8 @@ class BinanceMartingaleBot:
                         
                         await send_tg_async(
                             self.session,
-                            f"{icon} <b>ОТКРЫТА ПОЗИЦИЯ ({side})</b>\n"
-                            f"Цена: {entry_price} | Объем: {qty} BTC (~{self.strategy['usdt']} USDC)\n"
+                            f"{icon} <b>ОТКРЫТА ПОЗИЦИЯ ({side}) [{self.active_symbol}]</b>\n"
+                            f"Цена: {entry_price} | Объем: {qty} {self.base_asset} (~{self.strategy['usdt']} {self.quote_asset})\n"
                             f"🎯 TP: {tp_price} ({target_percent}%) | 🛑 SL: {sl_price} ({STOP_LOSS_PERCENT}%)\n"
                             f"Колено: #{current_step}/{MAX_STREAK}"
                         )
