@@ -30,7 +30,7 @@ MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.35))
 MAX_STREAK = int(os.getenv("MAX_STREAK", 3))
 
 # Динамическое расписание Тейк-Профитов по коленам (индексы 0, 1, 2 для 1, 2, 3 колен)
-TP_SCHEDULE = [0.25, 0.35, 0.45]
+TP_SCHEDULE = [0.30, 0.40, 0.50]
 
 # Фиксированный Стоп-Лосс в процентах
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.25))
