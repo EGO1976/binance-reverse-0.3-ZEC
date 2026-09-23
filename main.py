@@ -21,40 +21,25 @@ except ImportError:
     websockets = None
 
 # =========================================================================
-# ⚙️ ОСНОВНЫЕ НАСТРОЙКИ БОТА
+# ⚙️ ОСНОВНЫЕ НАСТРОЙКИ БОТА (8 КОЛЕН ПО 75 USDT, ДВУСТОРОННИЙ HEDGE MODE)
 # =========================================================================
-SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT").strip()
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
-USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 1000))
-MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.35))
-MAX_STREAK = int(os.getenv("MAX_STREAK", 3))
-
-# Динамическое расписание Тейк-Профитов по коленам (индексы 0, 1, 2 для 1, 2, 3 колен)
-TP_SCHEDULE = [0.30, 0.40, 0.50]
-
-# Фиксированный Стоп-Лосс в процентах
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.25))
-
-# Фильтрация по ATR и TTL продолжения тренда
-MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", 0.05))
-CONTINUATION_TTL_SECONDS = int(os.getenv("CONTINUATION_TTL_SECONDS", 900))  # 15 минут
+ORDER_USDT = float(os.getenv("ORDER_USDT", 85.0))  # 8 ордеров * 75 USDT = 600 USDT макс. позиция
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip().strip("'\"")
 BINANCE_API_SECRET = os.getenv("BINANCE_SECRET_KEY", "").strip().strip("'\"")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip().strip("'\"")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'\"")
-STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+STATE_FILE = os.getenv("STATE_FILE", "grid_bot_state.json")
+
+# Процентные шаги сетки от цены Anchor (8 колен)
+GRID_OFFSETS = [0.0, 0.8, 2.0, 3.6, 5.8, 8.8, 12.8, 15.0]
+PROFIT_TARGET_PCT = 0.5  # Скальп-профит +0.5%
 # =========================================================================
 
-def get_assets(symbol: str):
-    if symbol.endswith("USDC"):
-        return symbol[:-4], "USDC"
-    elif symbol.endswith("USDT"):
-        return symbol[:-4], "USDT"
-    return symbol, "USDT"
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-logger = logging.getLogger(f"{SYMBOL}_BOT")
+logger = logging.getLogger("GRID_SCALPER")
 
 LAST_ERROR_STATE = {"key": None, "sent": False}
 
@@ -79,7 +64,7 @@ async def send_tg_async(session: aiohttp.ClientSession, text: str, is_error: boo
         except Exception as e:
             logger.error(f"Ошибка отправки Telegram: {e}")
 
-def format_price(price, tick_size=0.1):
+def format_price(price: float, tick_size: float = 0.1) -> str:
     if tick_size <= 0:
         tick_size = 0.1
     precision = max(0, int(round(-math.log10(tick_size))))
@@ -87,41 +72,11 @@ def format_price(price, tick_size=0.1):
         return str(int(round(price)))
     return f"{price:.{precision}f}"
 
-def format_qty(qty, step_size=0.001):
+def format_qty(qty: float, step_size: float = 0.001) -> float:
     if step_size <= 0:
         step_size = 0.001
     precision = max(0, int(round(-math.log10(step_size))))
     return round(float(qty), precision)
-
-def round_to_tick(price: float, tick_size: float) -> float:
-    if tick_size <= 0:
-        return float(price)
-    p = Decimal(str(price))
-    tick = Decimal(str(tick_size))
-    steps = (p / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    result = steps * tick
-    return float(result)
-
-def calculate_tp_sl(entry_price: float, side: str, loss_streak: int, tick_size: float):
-    if entry_price <= 0:
-        raise ValueError("Некорректный entry_price")
-    
-    tp_idx = min(max(0, loss_streak), len(TP_SCHEDULE) - 1)
-    target_percent = TP_SCHEDULE[tp_idx]
-    
-    tp_distance = target_percent / 100.0
-    sl_distance = STOP_LOSS_PERCENT / 100.0
-
-    if side == "BUY":
-        raw_tp = entry_price * (1.0 + tp_distance)
-        raw_sl = entry_price * (1.0 - sl_distance)
-    else:
-        raw_tp = entry_price * (1.0 - tp_distance)
-        raw_sl = entry_price * (1.0 + sl_distance)
-
-    tp = round_to_tick(raw_tp, tick_size)
-    sl = round_to_tick(raw_sl, tick_size)
-    return format_price(tp, tick_size), format_price(sl, tick_size), target_percent
 
 class BinanceRateLimiter:
     def __init__(self, max_per_minute=1200):
@@ -147,21 +102,20 @@ class StateManager:
     def __init__(self, file_path):
         self.file_path = file_path
         self.state = {
-            "usdt": USDT_AMOUNT,
-            "side": "BUY",
-            "loss_streak": 0,
-            "qty": 0.0,
-            "entry_price": 0.0,
-            "state": "ENTRY",
-            "entry_time": 0.0,
-            "last_tp_time": 0.0,
-            "entry_order_id": 0,
-            "tp_order_id": 0,
-            "tp_client_id": "",
-            "sl_algo_id": 0,
-            "sl_client_algo_id": "",
-            "tp_price": 0.0,
-            "sl_price": 0.0
+            "LONG": {
+                "active": False,
+                "anchor_price": 0.0,
+                "filled_knee_max": 0,
+                "global_tp_order_id": 0,
+                "knee_tp_orders": {}  # {knee_idx: order_id}
+            },
+            "SHORT": {
+                "active": False,
+                "anchor_price": 0.0,
+                "filled_knee_max": 0,
+                "global_tp_order_id": 0,
+                "knee_tp_orders": {}
+            }
         }
         self.load()
 
@@ -172,7 +126,7 @@ class StateManager:
                 self.state.update(saved)
                 logger.info(f"Состояние загружено из {self.file_path}")
         except FileNotFoundError:
-            logger.info("Файл состояния не найден, используем начальные значения")
+            logger.info("Файл состояния не найден, запуск с начальными настройками")
         except Exception as e:
             logger.error(f"Ошибка загрузки состояния: {e}")
 
@@ -183,18 +137,7 @@ class StateManager:
         except Exception as e:
             logger.error(f"Ошибка сохранения состояния: {e}")
 
-    def get(self, key, default=None):
-        return self.state.get(key, default)
-
-    def set(self, key, value):
-        self.state[key] = value
-        self.save()
-
-    def update(self, data):
-        self.state.update(data)
-        self.save()
-
-class BinanceMartingaleBot:
+class GridHedgeBot:
     def __init__(self):
         self.base_url = "https://fapi.binance.com"
         self.ws_base_url = "wss://fstream.binance.com/ws"
@@ -202,95 +145,72 @@ class BinanceMartingaleBot:
         self.rate_limiter = BinanceRateLimiter()
         
         self.active_symbol = SYMBOL
-        self.base_asset, self.quote_asset = get_assets(self.active_symbol)
-        
         self.latest_price = 0.0
         self.last_price_time = 0.0
         self.is_running = True
         self.step_size = 0.001
         self.tick_size = 0.1
         self.listen_key = None
-        self.last_pos_check_time = 0.0
-        self.is_processing_close = False
         
         self.state_manager = StateManager(STATE_FILE)
-        self.strategy = self.state_manager.state
-        self.startup_sync_complete = False
-        self.adopted_existing_position = False
+        self.state = self.state_manager.state
+
+    @property
+    def base_asset(self):
+        for quote in ["USDC", "USDT", "BUSD", "FDUSD"]:
+            if self.active_symbol.endswith(quote):
+                return self.active_symbol[:-len(quote)]
+        return self.active_symbol
 
     async def _request(self, method, endpoint, params=None, signed=False, weight=1, suppress_error_codes=None):
         if suppress_error_codes is None:
             suppress_error_codes = []
 
         await self.rate_limiter.wait(weight=weight)
-        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
         
-        if params is None:
-            params = {}
-        else:
-            params = params.copy()
+        if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+            logger.error("❌ API Ключи не найдены!")
+            return {"code": -2014, "msg": "API Key or Secret missing"}
 
-        params.pop("timestamp", None)
-        params.pop("signature", None)
-
-        query_list = [f"{k}={ 'true' if v is True else ('false' if v is False else str(v)) }" for k, v in sorted(params.items(), key=lambda x: x[0])]
-
-        if signed:
-            timestamp = int(time.time() * 1000)
-            query_list.append(f"timestamp={timestamp}")
-
-        query_string = "&".join(query_list)
+        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+        payload = {}
+        if params:
+            for k, v in params.items():
+                payload[k] = "true" if v is True else ("false" if v is False else str(v))
 
         if signed:
+            payload['timestamp'] = str(int(time.time() * 1000))
+            payload['recvWindow'] = "5000"
+            query_string = urllib.parse.urlencode(payload)
             signature = hmac.new(
                 BINANCE_API_SECRET.encode('utf-8'),
                 query_string.encode('utf-8'),
                 hashlib.sha256
             ).hexdigest()
-            query_string += f"&signature={signature}"
+            full_query = f"{query_string}&signature={signature}"
+        else:
+            full_query = urllib.parse.urlencode(payload) if payload else ""
 
         url = f"{self.base_url}{endpoint}"
 
         try:
-            method_upper = method.upper()
-            if method_upper in ["POST", "PUT", "DELETE"]:
+            if method.upper() in ["POST", "PUT", "DELETE"]:
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
-                async with self.session.request(method_upper, url, data=query_string, headers=headers, timeout=3) as response:
-                    if response.status == 404:
-                        logger.warning(f"Binance API 404 Not Found [{endpoint}]")
-                        return {"code": 404, "msg": "Endpoint Not Found"}
-                    try:
-                        res = await response.json()
-                    except Exception:
-                        text_body = await response.text()
-                        logger.warning(f"Non-JSON response [{endpoint}]: {text_body[:100]}")
-                        return {"code": response.status, "msg": text_body[:100]}
+                async with self.session.request(method, url, data=full_query, headers=headers, timeout=5) as response:
+                    res = await response.json()
             else:
-                full_url = f"{url}?{query_string}" if query_string else url
-                async with self.session.request(method_upper, full_url, headers=headers, timeout=3) as response:
-                    if response.status == 404:
-                        logger.warning(f"Binance API 404 Not Found [{endpoint}]")
-                        return {"code": 404, "msg": "Endpoint Not Found"}
-                    try:
-                        res = await response.json()
-                    except Exception:
-                        text_body = await response.text()
-                        logger.warning(f"Non-JSON response [{endpoint}]: {text_body[:100]}")
-                        return {"code": response.status, "msg": text_body[:100]}
+                final_url = f"{url}?{full_query}" if full_query else url
+                async with self.session.request(method, final_url, headers=headers, timeout=5) as response:
+                    res = await response.json()
 
             if isinstance(res, dict) and "code" in res and res["code"] != 200:
                 code = res.get("code")
                 msg = res.get("msg", "")
-                if code not in suppress_error_codes and code != 404:
+                if code not in suppress_error_codes:
                     logger.error(f"Binance API Error [{endpoint}]: Code {code}, Msg: {msg}")
-                    if code == -1003:
-                        await send_tg_async(self.session, f"⚠️ <b>ПРЕВЫШЕН ЛИМИТ ЗАПРОСОВ</b>\n{msg}", is_error=True, error_key="rate_limit")
-                    elif code in [-2008, -2014, -2015, -1022]:
-                        await send_tg_async(self.session, f"⚠️ <b>ОШИБКА BINANCE API KEY</b>\n{msg} (Код {code})", is_error=True, error_key=f"api_{code}")
             return res
         except Exception as e:
             logger.error(f"Ошибка REST API [{endpoint}]: {e}")
-            await send_tg_async(self.session, f"⚠️ <b>СБОЙ СЕТЕВОГО СОЕДИНЕНИЯ</b>\n{e}", is_error=True, error_key="network_error")
             return {"code": -1, "msg": str(e)}
 
     async def fetch_symbol_info(self):
@@ -306,6 +226,14 @@ class BinanceMartingaleBot:
                     logger.info(f"Параметры {self.active_symbol}: stepSize={self.step_size}, tickSize={self.tick_size}")
                     break
 
+    async def setup_market(self):
+        # 1. Включаем Hedge Mode (dualSidePosition = true) для параллельного LONG и SHORT
+        await self._request("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true"}, signed=True, suppress_error_codes=[-4059, -4067])
+        # 2. Устанавливаем плечо
+        await self._request("POST", "/fapi/v1/leverage", {"symbol": self.active_symbol, "leverage": LEVERAGE}, signed=True)
+        # 3. Маржа Crossed (Кросс)
+        await self._request("POST", "/fapi/v1/marginType", {"symbol": self.active_symbol, "marginType": "CROSSED"}, signed=True, suppress_error_codes=[-4046, -4067])
+
     async def get_market_data(self):
         if self.latest_price > 0 and (time.time() - self.last_price_time) < 2.0:
             return self.latest_price
@@ -316,103 +244,272 @@ class BinanceMartingaleBot:
             return self.latest_price
         return 0.0
 
-    async def get_raw_position(self, retries=2):
-        for attempt in range(retries):
-            res = await self._request("GET", "/fapi/v2/positionRisk", {"symbol": self.active_symbol}, signed=True, weight=5)
-            if isinstance(res, list):
-                for pos in res:
-                    if pos.get("symbol") == self.active_symbol:
-                        return pos
-            await asyncio.sleep(0.3)
-        return None
+    async def cancel_side_orders(self, pos_side: str):
+        """Отменяет открытые ордера конкретной стороны (LONG или SHORT)"""
+        open_orders = await self._request("GET", "/fapi/v1/openOrders", {"symbol": self.active_symbol}, signed=True)
+        if isinstance(open_orders, list):
+            for o in open_orders:
+                if o.get("positionSide") == pos_side:
+                    await self._request("DELETE", "/fapi/v1/order", {
+                        "symbol": self.active_symbol,
+                        "orderId": o.get("orderId")
+                    }, signed=True)
 
-    async def get_actual_entry_price(self, order_id, side, retries=10):
-        expected_sign = 1 if side == "BUY" else -1
-        for _ in range(retries):
-            try:
-                order = await self._request("GET", "/fapi/v1/order", {
-                    "symbol": self.active_symbol,
-                    "orderId": order_id
-                }, signed=True, weight=1)
-                if isinstance(order, dict):
-                    avg_price = float(order.get("avgPrice", 0) or 0)
-                    if order.get("status") == "FILLED" and avg_price > 0:
-                        logger.info(f"🎯 Фактический avgPrice MARKET: {avg_price}")
-                        return avg_price
-            except Exception as e:
-                logger.warning(f"Ошибка получения MARKET order: {e}")
+    # =========================================================================
+    # 🎯 ЛОГИКА ТЕЙК-ПРОФИТОВ И РАСЧЕТА СЕТКИ
+    # =========================================================================
 
-            try:
-                pos = await self.get_raw_position(retries=1)
-                if pos:
-                    position_amt = float(pos.get("positionAmt", 0))
-                    entry_price = float(pos.get("entryPrice", 0))
-                    correct_direction = (expected_sign > 0 and position_amt > 0) or (expected_sign < 0 and position_amt < 0)
-                    if correct_direction and abs(position_amt) > 0 and entry_price > 0:
-                        logger.info(f"🎯 Фактический entryPrice из positionRisk: {entry_price}")
-                        return entry_price
-            except Exception as e:
-                logger.warning(f"Ошибка получения positionRisk: {e}")
-
-            await asyncio.sleep(0.2)
-        return 0.0
-
-    async def get_free_margin(self) -> float:
-        res = await self._request("GET", "/fapi/v2/account", signed=True, weight=5)
-        if isinstance(res, dict):
-            assets = res.get("assets", [])
-            target_asset = self.quote_asset
-            for asset in assets:
-                if asset.get("asset") == target_asset:
-                    val = float(asset.get("availableBalance", asset.get("maxWithdrawAmount", 0.0)))
-                    if val > 0:
-                        return val
-            root_avail = float(res.get("availableBalance", 0.0))
-            if root_avail > 0:
-                return root_avail
-            root_max_withdraw = float(res.get("maxWithdrawAmount", 0.0))
-            if root_max_withdraw > 0:
-                return root_max_withdraw
-        bal_res = await self._request("GET", "/fapi/v2/balance", signed=True, weight=1)
-        if isinstance(bal_res, list):
-            target_asset = self.quote_asset
-            for b in bal_res:
-                if b.get("asset") == target_asset:
-                    return float(b.get("availableBalance", b.get("maxWithdrawAmount", 0.0)))
-        return 0.0
-
-    async def get_atr_and_candle_color(self):
-        res = await self._request("GET", "/fapi/v1/klines", {
-            "symbol": self.active_symbol,
-            "interval": "5m",
-            "limit": 15
-        }, weight=1)
+    def get_grid_levels(self, anchor_price: float, pos_side: str):
+        """Рассчитывает 8 цен входа и скальп-ТейкПрофиты для каждого колена"""
+        levels = []
+        is_long = (pos_side == "LONG")
         
-        if not isinstance(res, list) or len(res) < 15:
-            logger.warning("Не удалось получить достаточное количество свечей для ATR")
-            return 0.0, "BUY"
+        for idx, pct in enumerate(GRID_OFFSETS, start=1):
+            if is_long:
+                entry_p = anchor_price * (1.0 - pct / 100.0)
+                scalp_tp_p = entry_p * (1.0 + PROFIT_TARGET_PCT / 100.0)
+            else:
+                entry_p = anchor_price * (1.0 + pct / 100.0)
+                scalp_tp_p = entry_p * (1.0 - PROFIT_TARGET_PCT / 100.0)
+                
+            qty = format_qty(ORDER_USDT / entry_p, self.step_size)
+            levels.append({
+                "knee": idx,
+                "entry_price": float(format_price(entry_p, self.tick_size)),
+                "scalp_tp_price": float(format_price(scalp_tp_p, self.tick_size)),
+                "qty": qty
+            })
+        return levels
 
-        tr_list = []
-        for i in range(1, len(res)):
-            high = float(res[i][2])
-            low = float(res[i][3])
-            prev_close = float(res[i-1][4])
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            tr_list.append(tr)
+    async def update_global_tp(self, pos_side: str):
+        """Перерасчитывает и перевыставляет Единый Тейк-Профит пачки (+0.5% от средневзвешенной цены P_avg)"""
+        positions = await self._request("GET", "/fapi/v2/positionRisk", {"symbol": self.active_symbol}, signed=True)
+        if not isinstance(positions, list):
+            return
+        
+        pos = next((p for p in positions if p.get("positionSide") == pos_side), None)
+        if not pos:
+            return
 
-        atr = sum(tr_list[-14:]) / 14.0
-        current_price = float(res[-1][4])
-        atr_percent = (atr / current_price) * 100.0 if current_price > 0 else 0.0
+        pos_amt = abs(float(pos.get("positionAmt", 0)))
+        entry_price = float(pos.get("entryPrice", 0))
 
-        last_open = float(res[-1][1])
-        last_close = float(res[-1][4])
-        candle_color = "BUY" if last_close >= last_open else "SELL"
+        if pos_amt == 0 or entry_price == 0:
+            return
 
-        logger.info(f"📊 ATR(14) 5m = {atr_percent:.3f}% (Мин: {MIN_ATR_PERCENT}%), Цвет свечи = {candle_color}")
-        return atr_percent, candle_color
+        is_long = (pos_side == "LONG")
+        if is_long:
+            global_tp_p = entry_price * (1.0 + PROFIT_TARGET_PCT / 100.0)
+            close_side = "SELL"
+        else:
+            global_tp_p = entry_price * (1.0 - PROFIT_TARGET_PCT / 100.0)
+            close_side = "BUY"
+
+        formatted_tp = format_price(global_tp_p, self.tick_size)
+
+        # 1. Отменяем прошлый Global TP ордер, если он существовал
+        old_tp_id = self.state[pos_side].get("global_tp_order_id", 0)
+        if old_tp_id:
+            await self._request("DELETE", "/fapi/v1/order", {
+                "symbol": self.active_symbol,
+                "orderId": old_tp_id
+            }, signed=True, suppress_error_codes=[-2011])
+
+        # 2. Выставляем новый Лимитный Тейк-Профит на весь объём текущей позиции
+        res = await self._request("POST", "/fapi/v1/order", {
+            "symbol": self.active_symbol,
+            "side": close_side,
+            "positionSide": pos_side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": pos_amt,
+            "price": formatted_tp,
+            "reduceOnly": "true",
+            "newClientOrderId": f"gtp_{pos_side[:1]}_{uuid.uuid4().hex[:8]}"
+        }, signed=True)
+
+        if isinstance(res, dict) and res.get("orderId"):
+            self.state[pos_side]["global_tp_order_id"] = res["orderId"]
+            self.state_manager.save()
+            logger.info(f"🎯 [{pos_side}] Обновлен Global TP: {formatted_tp} на объем {pos_amt}")
+
+    async def place_grid_orders(self, pos_side: str, anchor_price: float):
+        """Размещает первичную сетку лимитных ордеров (1-й сразу по маркету, 2-8 лимитками)"""
+        await self.cancel_side_orders(pos_side)
+        levels = self.get_grid_levels(anchor_price, pos_side)
+        
+        is_long = (pos_side == "LONG")
+        entry_side = "BUY" if is_long else "SELL"
+
+        # 1-й ордер исполняем по MARKET
+        k1 = levels[0]
+        res_m = await self._request("POST", "/fapi/v1/order", {
+            "symbol": self.active_symbol,
+            "side": entry_side,
+            "positionSide": pos_side,
+            "type": "MARKET",
+            "quantity": k1["qty"],
+            "newClientOrderId": f"m1_{pos_side[:1]}_{uuid.uuid4().hex[:8]}"
+        }, signed=True)
+
+        if not (isinstance(res_m, dict) and res_m.get("orderId")):
+            logger.error(f"❌ Не удалось открыть маркет-ордер 1-го колена для {pos_side}: {res_m}")
+            return False
+
+        # Выставляем оставшиеся 7 колен лимитками
+        for lvl in levels[1:]:
+            await self._request("POST", "/fapi/v1/order", {
+                "symbol": self.active_symbol,
+                "side": entry_side,
+                "positionSide": pos_side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": lvl["qty"],
+                "price": str(lvl["entry_price"]),
+                "newClientOrderId": f"k{lvl['knee']}_{pos_side[:1]}_{uuid.uuid4().hex[:8]}"
+            }, signed=True)
+
+        self.state[pos_side].update({
+            "active": True,
+            "anchor_price": anchor_price,
+            "filled_knee_max": 1,
+            "knee_tp_orders": {}
+        })
+        self.state_manager.save()
+
+        # Выставляем Тейк-Профит на 1-е колено
+        await self.update_global_tp(pos_side)
+        
+        icon = "🟢" if is_long else "🔻"
+        await send_tg_async(
+            self.session,
+            f"{icon} <b>ЗАПУЩЕНА СЕТКА {pos_side} [{self.active_symbol}]</b>\n"
+            f"Anchor-цена: {anchor_price}\n"
+            f"Колен: 8 по {ORDER_USDT} USDT (Макс: 600 USDT)\n"
+            f"Плечо: {LEVERAGE}x | Скальп-Цель: +{PROFIT_TARGET_PCT}%"
+        )
+        return True
+
+    # =========================================================================
+    # ⚡ ОБРАБОТКА WEBSOCKET СОБЫТИЙ СЕТКИ И ОРДЕРОВ
+    # =========================================================================
+
+    async def handle_order_update(self, order_data: dict):
+        status = order_data.get("X")
+        if status != "FILLED":
+            return
+
+        pos_side = order_data.get("ps")  # LONG или SHORT
+        if pos_side not in ["LONG", "SHORT"]:
+            return
+
+        client_id = str(order_data.get("c", ""))
+        price = float(order_data.get("L", 0) or order_data.get("p", 0))
+        qty = float(order_data.get("l", 0) or order_data.get("q", 0))
+
+        # 1. Сработало одно из колен сетки (покупка в LONG или продажа в SHORT)
+        if client_id.startswith("k") or client_id.startswith("m1"):
+            knee_idx = int(client_id[1]) if client_id.startswith("k") else 1
+            logger.info(f"📥 [{pos_side}] Сработало колено #{knee_idx} по цене {price}")
+
+            # Пересчитываем Global TP позиции
+            await self.update_global_tp(pos_side)
+
+            # Выставляем индивидуальный Скальп-TP для этого колена
+            is_long = (pos_side == "LONG")
+            close_side = "SELL" if is_long else "BUY"
+            scalp_tp_price = price * (1.0 + PROFIT_TARGET_PCT / 100.0) if is_long else price * (1.0 - PROFIT_TARGET_PCT / 100.0)
+            formatted_scalp_tp = format_price(scalp_tp_price, self.tick_size)
+
+            tp_res = await self._request("POST", "/fapi/v1/order", {
+                "symbol": self.active_symbol,
+                "side": close_side,
+                "positionSide": pos_side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": qty,
+                "price": formatted_scalp_tp,
+                "reduceOnly": "true",
+                "newClientOrderId": f"stp_k{knee_idx}_{uuid.uuid4().hex[:6]}"
+            }, signed=True)
+
+            if isinstance(tp_res, dict) and tp_res.get("orderId"):
+                self.state[pos_side]["knee_tp_orders"][str(knee_idx)] = tp_res["orderId"]
+                self.state_manager.save()
+
+            await send_tg_async(
+                self.session,
+                f"📥 <b>[{pos_side}] НАБОР КОЛЕНА #{knee_idx}</b>\n"
+                f"Цена входа: {price}\n"
+                f"Скальп-TP колена: {formatted_scalp_tp}"
+            )
+
+        # 2. Сработал Индивидуальный Скальп-TP колена
+        elif client_id.startswith("stp_k"):
+            knee_idx = int(client_id[5])
+            logger.info(f"💰 [{pos_side}] Закрыто по Скальп-TP колено #{knee_idx}")
+
+            # Пересчитываем Единый Тейк
+            await self.update_global_tp(pos_side)
+
+            # Перевыставляем лимитку этого колена обратно в стакан
+            anchor_p = self.state[pos_side]["anchor_price"]
+            levels = self.get_grid_levels(anchor_p, pos_side)
+            target_lvl = next((l for l in levels if l["knee"] == knee_idx), None)
+
+            if target_lvl:
+                is_long = (pos_side == "LONG")
+                entry_side = "BUY" if is_long else "SELL"
+                await self._request("POST", "/fapi/v1/order", {
+                    "symbol": self.active_symbol,
+                    "side": entry_side,
+                    "positionSide": pos_side,
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": target_lvl["qty"],
+                    "price": str(target_lvl["entry_price"]),
+                    "newClientOrderId": f"k{knee_idx}_{pos_side[:1]}_{uuid.uuid4().hex[:8]}"
+                }, signed=True)
+
+            await send_tg_async(
+                self.session,
+                f"💰 <b>[{pos_side}] СКАЛЬП-ПРОФИТ КОЛЕНА #{knee_idx}!</b>\n"
+                f"Цена закрытия: {price} (+{PROFIT_TARGET_PCT}%)\n"
+                f"🔄 Лимитка колена #{knee_idx} возвращена в стакан."
+            )
+
+        # 3. Сработал Единый Global TP (вся позиция закрыта полностью)
+        elif client_id.startswith("gtp"):
+            logger.info(f"🎉 [{pos_side}] СРАБОТАЛ ЕДИНЫЙ ТЕЙК-ПРОФИТ ВСЕЙ СЕТКИ!")
+            await self.cancel_side_orders(pos_side)
+            
+            self.state[pos_side].update({
+                "active": False,
+                "anchor_price": 0.0,
+                "filled_knee_max": 0,
+                "global_tp_order_id": 0,
+                "knee_tp_orders": {}
+            })
+            self.state_manager.save()
+
+            await send_tg_async(
+                self.session,
+                f"🎉 <b>[{pos_side}] ВСЯ СЕТКА ЗАКРЫТА ПО ЕДИНОМУ TP!</b>\n"
+                f"Цена: {price}\n"
+                f"🔄 Сетка полностью перезапускается от новой текущей цены..."
+            )
+
+            # Перезапускаем сетку от новой текущей цены
+            new_anchor = await self.get_market_data()
+            if new_anchor > 0:
+                await self.place_grid_orders(pos_side, new_anchor)
+
+    # =========================================================================
+    # 🔄 ФОНОВЫЕ ПОТОКИ И WEBSOCKETS
+    # =========================================================================
 
     async def get_listen_key(self):
-        res = await self._request("POST", "/fapi/v1/listenKey", signed=True, weight=1)
+        res = await self._request("POST", "/fapi/v1/listenKey", signed=True)
         if isinstance(res, dict) and "listenKey" in res:
             self.listen_key = res["listenKey"]
             return self.listen_key
@@ -422,156 +519,7 @@ class BinanceMartingaleBot:
         while self.is_running:
             await asyncio.sleep(1500)
             if self.listen_key:
-                await self._request("PUT", "/fapi/v1/listenKey", signed=True, weight=1)
-                logger.info("🔑 ListenKey обновлен")
-
-    async def cancel_all_orders(self):
-        await self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011])
-        await self._request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011, -1002, 404])
-
-    async def place_tp_sl_orders(self, side, qty, entry_price, loss_streak):
-        if entry_price <= 0:
-            logger.error("❌ TP/SL НЕ ВЫСТАВЛЕНЫ: entry_price <= 0")
-            return None, None, 0.0
-
-        await self.cancel_all_orders()
-        opp_side = "SELL" if side == "BUY" else "BUY"
-
-        formatted_tp_price, formatted_sl_price, target_percent = calculate_tp_sl(
-            entry_price=entry_price,
-            side=side,
-            loss_streak=loss_streak,
-            tick_size=self.tick_size
-        )
-        tp_numeric = float(formatted_tp_price)
-        sl_numeric = float(formatted_sl_price)
-
-        self.strategy.update({
-            "tp_order_id": 0,
-            "tp_client_id": "",
-            "sl_algo_id": 0,
-            "sl_client_algo_id": "",
-            "tp_price": tp_numeric,
-            "sl_price": sl_numeric
-        })
-
-        sl_client_id = f"sl_{uuid.uuid4().hex[:10]}"
-        sl_res = await self._request("POST", "/fapi/v1/algoOrder", {
-            "symbol": self.active_symbol,
-            "side": opp_side,
-            "positionSide": "BOTH",
-            "algoType": "CONDITIONAL",
-            "type": "STOP_MARKET",
-            "triggerPrice": formatted_sl_price,
-            "closePosition": True,
-            "workingType": "CONTRACT_PRICE",
-            "clientAlgoId": sl_client_id
-        }, signed=True, weight=1)
-        
-        sl_ok = isinstance(sl_res, dict) and sl_res.get("algoId") is not None
-        if sl_ok:
-            self.strategy["sl_algo_id"] = int(sl_res.get("algoId", 0))
-            self.strategy["sl_client_algo_id"] = sl_client_id
-
-        tp_client_id = f"tp_{uuid.uuid4().hex[:10]}"
-        tp_res = await self._request("POST", "/fapi/v1/order", {
-            "symbol": self.active_symbol,
-            "side": opp_side,
-            "positionSide": "BOTH",
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": qty,
-            "price": formatted_tp_price,
-            "reduceOnly": True,
-            "newClientOrderId": tp_client_id
-        }, signed=True, weight=1)
-        
-        tp_ok = isinstance(tp_res, dict) and tp_res.get("orderId") is not None
-        if tp_ok:
-            self.strategy["tp_order_id"] = int(tp_res.get("orderId", 0))
-            self.strategy["tp_client_id"] = tp_client_id
-
-        self.state_manager.save()
-
-        if tp_ok and sl_ok:
-            logger.info(f"✅ TP: {formatted_tp_price} ({target_percent}%), SL: {formatted_sl_price} ({STOP_LOSS_PERCENT}%)")
-        else:
-            logger.warning(f"⚠️ TP: {'✅' if tp_ok else '❌'}, SL: {'✅' if sl_ok else '❌'}")
-
-        return formatted_tp_price, formatted_sl_price, target_percent
-
-    async def sync_existing_position(self):
-        pos = await self.get_raw_position(retries=5)
-        if pos:
-            amt = float(pos.get("positionAmt", 0.0))
-            entry_price = float(pos.get("entryPrice", 0.0))
-            if abs(amt) > 0 and entry_price > 0:
-                self.adopted_existing_position = True
-                side = "BUY" if amt > 0 else "SELL"
-                qty = abs(amt)
-                approx_quote = round(qty * entry_price, 2)
-                
-                calculated_streak = 0
-                current_target_quote = USDT_AMOUNT
-                for step in range(MAX_STREAK):
-                    if approx_quote >= current_target_quote * 0.85:
-                        calculated_streak = step
-                    current_target_quote *= MARTINGALE_MULTIPLIER
-                
-                loss_streak = min(calculated_streak, MAX_STREAK - 1)
-                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_quote} {self.quote_asset}")
-                
-                self.strategy.update({
-                    "usdt": max(approx_quote, USDT_AMOUNT),
-                    "side": side,
-                    "entry_price": entry_price,
-                    "qty": qty,
-                    "loss_streak": loss_streak,
-                    "state": "MONITOR",
-                    "entry_time": time.time()
-                })
-                self.state_manager.save()
-
-                tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak)
-                formatted_entry = format_price(entry_price, self.tick_size)
-                current_step = loss_streak + 1
-                await send_tg_async(
-                    self.session,
-                    f"🔄 <b>СИНХРОНИЗАЦИЯ {self.active_symbol}</b>\n"
-                    f"Позиция: <b>{side} {qty} {self.base_asset}</b> (~{approx_quote} {self.quote_asset})\n"
-                    f"Определено колено: <b>#{current_step}/{MAX_STREAK}</b>\n"
-                    f"Вход: {formatted_entry}\n"
-                    f"🎯 TP: {tp_price} ({target_percent}%)\n"
-                    f"🛑 SL: {sl_price} ({STOP_LOSS_PERCENT}%)"
-                )
-                return True
-        return False
-
-    async def setup_market(self):
-        await self._request("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"}, signed=True, suppress_error_codes=[-4059, -4067])
-        await self._request("POST", "/fapi/v1/leverage", {"symbol": self.active_symbol, "leverage": LEVERAGE}, signed=True)
-        await self._request("POST", "/fapi/v1/marginType", {"symbol": self.active_symbol, "marginType": "CROSSED"}, signed=True, suppress_error_codes=[-4046, -4067])
-
-    async def ws_ticker_loop(self):
-        if not websockets:
-            return
-        stream_name = f"{self.active_symbol.lower()}@ticker"
-        url = f"{self.ws_base_url}/{stream_name}"
-        while self.is_running:
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    logger.info(f"⚡ Market WebSocket подключен ({self.active_symbol})")
-                    async for msg in ws:
-                        if not self.is_running:
-                            break
-                        data = ujson.loads(msg)
-                        price = float(data.get("c", 0))
-                        if price > 0:
-                            self.latest_price = price
-                            self.last_price_time = time.time()
-            except Exception as e:
-                logger.warning(f"Ошибка WebSocket Ticker: {e}. Переподключение...")
-                await asyncio.sleep(3)
+                await self._request("PUT", "/fapi/v1/listenKey", signed=True)
 
     async def ws_user_data_loop(self):
         if not websockets:
@@ -588,575 +536,42 @@ class BinanceMartingaleBot:
                     async for msg in ws:
                         if not self.is_running:
                             break
-                        try:
-                            data = ujson.loads(msg)
-                            event_type = data.get("e")
-                            
-                            if event_type == "ORDER_TRADE_UPDATE":
-                                order_data = data.get("o", {})
-                                status = order_data.get("X")
-                                client_id = str(order_data.get("c", ""))
-                                if status in ["FILLED", "EXECUTED"]:
-                                    saved_tp_id = int(self.strategy.get("tp_order_id", 0) or 0)
-                                    order_id = int(order_data.get("i", 0) or 0)
-                                    saved_tp_client = self.strategy.get("tp_client_id", "")
-                                    if ((saved_tp_client and client_id == saved_tp_client) or
-                                            (saved_tp_id and order_id == saved_tp_id)):
-                                        logger.info("🎯 WS: ТОЧНО ИСПОЛНЕН TP")
-                                        asyncio.create_task(self.handle_position_closed(close_type="TP"))
-                            
-                            elif event_type in ["ALGO_UPDATE", "ALGO_ORDER_UPDATE"]:
-                                algo_data = data.get("o", {})
-                                status = algo_data.get("X", algo_data.get("s"))
-                                client_algo_id = str(algo_data.get("ca", algo_data.get("clientAlgoId", "")))
-                                algo_id = int(algo_data.get("i", algo_data.get("aid", algo_data.get("algoId", 0))) or 0)
-                                saved_sl_id = int(self.strategy.get("sl_algo_id", 0) or 0)
-                                saved_sl_client = self.strategy.get("sl_client_algo_id", "")
-                                if status in ["FILLED", "EXECUTED", "FINISHED"]:
-                                    if ((saved_sl_client and client_algo_id == saved_sl_client) or
-                                            (saved_sl_id and algo_id == saved_sl_id)):
-                                        logger.info("🛑 WS ALGO: ТОЧНО ИСПОЛНЕН SL")
-                                        asyncio.create_task(self.handle_position_closed(close_type="SL"))
-                            
-                            elif event_type == "ACCOUNT_UPDATE":
-                                acc_data = data.get("a", {})
-                                positions = acc_data.get("P", [])
-                                for p in positions:
-                                    if p.get("s") == self.active_symbol:
-                                        pa = float(p.get("pa", 0))
-                                        if pa == 0 and self.strategy["state"] == "MONITOR":
-                                            logger.info("📊 ACCOUNT_UPDATE: позиция закрыта")
-                                            asyncio.create_task(self.handle_position_closed())
-                        except Exception as e:
-                            logger.error(f"Ошибка обработки WS: {e}")
+                        data = ujson.loads(msg)
+                        if data.get("e") == "ORDER_TRADE_UPDATE":
+                            await self.handle_order_update(data.get("o", {}))
             except Exception as e:
                 logger.warning(f"Ошибка UserStream WS: {e}. Переподключение...")
                 await asyncio.sleep(5)
 
-    async def get_last_executed_order(self):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
-        saved_tp_id = int(self.strategy.get("tp_order_id", 0) or 0)
-        saved_tp_client = self.strategy.get("tp_client_id", "")
-        saved_sl_id = int(self.strategy.get("sl_algo_id", 0) or 0)
-        saved_sl_client = self.strategy.get("sl_client_algo_id", "")
-        best = None
-
-        try:
-            res = await self._request("GET", "/fapi/v1/allOrders", {
-                "symbol": self.active_symbol,
-                "limit": 50
-            }, signed=True)
-            if isinstance(res, list):
-                for order in res:
-                    if order.get("status") != "FILLED":
-                        continue
-                    oid = int(order.get("orderId", order.get("i", 0)) or 0)
-                    cid = str(order.get("clientOrderId", ""))
-                    update_time = int(order.get("updateTime", 0) or 0)
-                    if update_time <= max(0, entry_time_ms - 5000):
-                        continue
-                    if (saved_tp_id and oid == saved_tp_id) or (saved_tp_client and cid == saved_tp_client):
-                        best = ("TP", update_time)
-                        break
-        except Exception as e:
-            logger.error(f"Ошибка проверки TP ордера: {e}")
-
-        if best is None:
-            try:
-                res = await self._request("GET", "/fapi/v1/algoOpenOrders", {
-                    "symbol": self.active_symbol
-                }, signed=True, suppress_error_codes=[404, -2011])
-                if isinstance(res, list):
-                    for order in res:
-                        if order.get("status") not in ["FILLED", "FINISHED"]:
-                            continue
-                        aid = int(order.get("algoId", order.get("i", 0)) or 0)
-                        cid = str(order.get("clientAlgoId", order.get("ca", "")))
-                        update_time = int(order.get("updateTime", order.get("T", 0)) or 0)
-                        if update_time <= max(0, entry_time_ms - 5000):
-                            continue
-                        if (saved_sl_id and aid == saved_sl_id) or (saved_sl_client and cid == saved_sl_client):
-                            best = ("SL", update_time)
-                            break
-            except Exception as e:
-                logger.error(f"Ошибка проверки SL algo history: {e}")
-
-        if best:
-            logger.info(f"🔎 Закрытие определено по идентификатору ордера: {best[0]}")
-            return best[0], None
-
-        trade = await self.get_last_closing_trade()
-        if trade:
-            exit_price = float(trade.get("price", 0) or 0)
-            tp_price = float(self.strategy.get("tp_price", 0) or 0)
-            sl_price = float(self.strategy.get("sl_price", 0) or 0)
-
-            candidates = []
-            if tp_price > 0:
-                candidates.append((abs(exit_price - tp_price), "TP"))
-            if sl_price > 0:
-                candidates.append((abs(exit_price - sl_price), "SL"))
-
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                result = candidates[0][1]
-                logger.warning(
-                    f"⚠️ ID ордера не найден. Определение по РЕАЛЬНОЙ цене исполнения: "
-                    f"exit={exit_price:.8f}, TP={tp_price:.8f}, SL={sl_price:.8f} => {result}"
-                )
-                return result, trade
-
-        logger.error("❌ Не удалось детерминированно определить TP/SL: нет подтвержденного ордера и closing trade")
-        return "UNKNOWN", None
-
-    async def get_last_closing_trade(self):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
-        side = self.strategy.get("side", "BUY")
-        closing_side = "SELL" if side == "BUY" else "BUY"
-
-        try:
-            res = await self._request("GET", "/fapi/v1/userTrades", {
-                "symbol": self.active_symbol,
-                "startTime": max(0, entry_time_ms - 5000),
-                "limit": 100
-            }, signed=True, weight=5)
-            if not isinstance(res, list):
-                return None
-
-            candidates = []
-            for trade in res:
-                t = int(trade.get("time", 0) or 0)
-                if t < max(0, entry_time_ms - 5000):
-                    continue
-                if str(trade.get("side", "")).upper() != closing_side:
-                    continue
-                qty = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
-                if qty <= 0:
-                    continue
-                candidates.append(trade)
-
-            if not candidates:
-                return None
-            candidates.sort(key=lambda x: int(x.get("time", 0) or 0), reverse=True)
-            return candidates[0]
-        except Exception as e:
-            logger.error(f"Ошибка получения реального closing trade: {e}")
-            return None
-
-    async def calculate_realized_pnl(self, entry_price, exit_price, qty, side):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
-        closing_side = "SELL" if side == "BUY" else "BUY"
-
-        try:
-            res = await self._request("GET", "/fapi/v1/userTrades", {
-                "symbol": self.active_symbol,
-                "startTime": max(0, entry_time_ms - 5000),
-                "limit": 100
-            }, signed=True, weight=5)
-            if isinstance(res, list):
-                realized = 0.0
-                commission = 0.0
-                exit_qty = 0.0
-                exit_notional = 0.0
-                last_exit_price = exit_price
-                has_exit = False
-
-                for trade in res:
-                    t = int(trade.get("time", 0) or 0)
-                    if t < max(0, entry_time_ms - 5000):
-                        continue
-                    trade_side = str(trade.get("side", "")).upper()
-                    rp = float(trade.get("realizedPnl", 0) or 0)
-                    comm = float(trade.get("commission", 0) or 0)
-                    commission += abs(comm)
-                    realized += rp
-
-                    if trade_side == closing_side:
-                        q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
-                        px = float(trade.get("price", 0) or 0)
-                        if q > 0 and px > 0:
-                            exit_qty += q
-                            exit_notional += q * px
-                            last_exit_price = px
-                            has_exit = True
-
-                if (has_exit and abs(realized) > 0) or (has_exit and commission > 0):
-                    avg_exit = exit_notional / exit_qty if exit_qty > 0 else last_exit_price
-                    net = realized - commission
-                    notional = abs(entry_price * qty)
-                    return {
-                        "gross": realized,
-                        "fee": commission,
-                        "net": net,
-                        "percent": (net / notional) * 100 if notional > 0 else 0.0,
-                        "exit_price": avg_exit,
-                        "exit_qty": exit_qty
-                    }
-        except Exception as e:
-            logger.error(f"Ошибка расчета реального PnL: {e}")
-
-        return None
-
-    async def handle_position_closed(self, close_type=None):
-        if self.is_processing_close:
-            logger.info("Уже обрабатываем закрытие, пропускаем")
-            return
-        if self.strategy["state"] != "MONITOR":
-            logger.info(f"Стратегия в состоянии {self.strategy['state']}, пропускаем")
-            return
-        
-        self.is_processing_close = True
-        try:
-            if close_type is None:
-                close_type, close_trade = await self.get_last_executed_order()
-            else:
-                close_trade = None
-
-            if close_type == "UNKNOWN" or close_type is None:
-                logger.warning("⏳ TP/SL пока не подтвержден Binance. Повторная проверка через 0.5 сек...")
-                await asyncio.sleep(0.5)
-                close_type, close_trade = await self.get_last_executed_order()
-                if close_type == "UNKNOWN" or close_type is None:
-                    logger.error("❌ TP/SL не подтвержден. Состояние стратегии НЕ изменяем.")
-                    await send_tg_async(
-                        self.session,
-                        "⚠️ <b>ЗАКРЫТИЕ ПОДТВЕРЖДЕНО, НО TP/SL ЕЩЕ НЕ ОПРЕДЕЛЕН</b>\n"
-                        "Стратегия ждет подтверждение Binance и не делает ошибочный переворот.",
-                        is_error=True,
-                        error_key="unknown_close"
-                    )
-                    return
-
-            logger.info(f"Обработка закрытия позиции: {close_type}")
-
-            side = self.strategy.get("side", "BUY")
-            entry_price = float(self.strategy.get("entry_price", 0) or 0)
-            qty = float(self.strategy.get("qty", 0) or 0)
-            loss_streak = self.strategy.get("loss_streak", 0)
-
-            pnl_data = await self.calculate_realized_pnl(
-                entry_price,
-                float(close_trade.get("price", 0)) if close_trade else 0.0,
-                qty,
-                side
-            )
-            
-            if close_type == "TP":
-                current_step = loss_streak + 1
-                msg = f"✅ <b>ТЕЙК-ПРОФИТ ({self.active_symbol})!</b>\n"
-                msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
-                msg += f"Направление: {side}\n"
-                if pnl_data:
-                    sign = "+" if pnl_data["net"] >= 0 else ""
-                    msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} {self.quote_asset} ({sign}{pnl_data['percent']:.2f}%)\n"
-                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} {self.quote_asset}\n"
-                    msg += f"💳 Баланс: {await self.get_free_margin():.2f} {self.quote_asset}"
-                else:
-                    msg += "📊 PnL: данные Binance еще не получены"
-                await send_tg_async(self.session, msg)
-                
-                self.strategy.update({
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "tp_order_id": 0,
-                    "tp_client_id": "",
-                    "sl_algo_id": 0,
-                    "sl_client_algo_id": "",
-                    "tp_price": 0.0,
-                    "sl_price": 0.0,
-                    "last_tp_time": time.time(),
-                    "state": "ENTRY"
-                })
-                self.state_manager.save()
-                
-            elif close_type == "SL":
-                next_streak = loss_streak + 1
-                if next_streak >= MAX_STREAK:
-                    msg = f"🛑 <b>СТОП-ЛОСС НА МАКСИМАЛЬНОМ КОЛЕНЕ (#{MAX_STREAK}) [{self.active_symbol}]!</b>\n"
-                    msg += f"Достигнут предел серии. Сброс до начального депозита и чистого старта."
-                    await send_tg_async(self.session, msg)
-                    
-                    self.strategy.update({
-                        "state": "ENTRY",
-                        "loss_streak": 0,
-                        "usdt": USDT_AMOUNT,
-                        "side": "BUY",
-                        "qty": 0.0,
-                        "entry_price": 0.0,
-                        "last_tp_time": 0.0
-                    })
-                    self.state_manager.save()
-                    return
-                
-                next_usdt = round(self.strategy["usdt"] * MARTINGALE_MULTIPLIER, 2)
-                
-                self.strategy["state"] = "PROCESSING"
-                self.strategy["loss_streak"] = next_streak
-                self.state_manager.save()
-                
-                pos = await self.get_raw_position(retries=5)
-                while pos and abs(float(pos.get("positionAmt", 0.0))) != 0:
-                    logger.info("Ожидание полного закрытия позиции перед переворотом...")
-                    await asyncio.sleep(0.5)
-                    pos = await self.get_raw_position(retries=2)
-                
-                success = await self.execute_flip(side, next_usdt, next_streak)
-                if success:
-                    self.strategy["state"] = "MONITOR"
-                else:
-                    logger.error("Сбой переворота, откат состояния к MONITOR")
-                    self.strategy["state"] = "MONITOR"
-                self.state_manager.save()
-                
-            else:
-                logger.warning(f"Неизвестный тип закрытия: {close_type}")
-                self.strategy.update({
-                    "state": "ENTRY",
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "side": "BUY",
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "last_tp_time": 0.0
-                })
-                self.state_manager.save()
-        finally:
-            self.is_processing_close = False
-
-    async def execute_flip(self, current_side, next_usdt, loss_streak):
-        new_side = "SELL" if current_side == "BUY" else "BUY"
-        last_price = await self.get_market_data()
-        if last_price <= 0:
-            logger.error("Невозможно выполнить переворот: цена равна 0")
-            return False
-
-        pos = await self.get_raw_position(retries=5)
-        if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-            logger.error("🛡️ ПЕРЕВОРОТ ЗАБЛОКИРОВАН: старая позиция еще не закрыта полностью.")
-            return False
-
-        await self.cancel_all_orders()
-        new_raw_qty = next_usdt / last_price
-        new_qty = format_qty(new_raw_qty, self.step_size)
-
-        res = await self._request("POST", "/fapi/v1/order", {
-            "symbol": self.active_symbol,
-            "side": new_side,
-            "positionSide": "BOTH",
-            "type": "MARKET",
-            "quantity": new_qty,
-            "newClientOrderId": f"flip_{uuid.uuid4().hex[:10]}"
-        }, signed=True, weight=1)
-
-        if isinstance(res, dict) and res.get("orderId"):
-            order_id = res.get("orderId")
-            entry_price = await self.get_actual_entry_price(order_id, side=new_side)
-            if entry_price <= 0:
-                entry_price = float(res.get("avgPrice", 0))
-                if entry_price == 0:
-                    entry_price = last_price
-
-            self.strategy.update({
-                "side": new_side,
-                "usdt": next_usdt,
-                "qty": new_qty,
-                "entry_price": entry_price,
-                "entry_time": time.time()
-            })
-            self.state_manager.save()
-
-            current_step = loss_streak + 1
-            tp_price, sl_price, target_percent = await self.place_tp_sl_orders(new_side, new_qty, entry_price, loss_streak)
-            formatted_entry = format_price(entry_price, self.tick_size)
-
-            await send_tg_async(
-                self.session,
-                f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ [{self.active_symbol}]!</b>\n"
-                f"{current_side} → {new_side}\n"
-                f"Вход: {formatted_entry} | Объем: {new_qty} {self.base_asset} (~{next_usdt} {self.quote_asset})\n"
-                f"🎯 TP: {tp_price} ({target_percent}%) | 🛑 SL: {sl_price} ({STOP_LOSS_PERCENT}%)\n"
-                f"Колено: #{current_step}/{MAX_STREAK}"
-            )
-            return True
-        else:
-            logger.error(f"Ошибка исполнения переворота: {res}")
-            return False
-
     async def start(self):
         self.session = aiohttp.ClientSession()
-        self.active_symbol = SYMBOL
-        self.base_asset, self.quote_asset = get_assets(self.active_symbol)
-        
         await self.fetch_symbol_info()
         await self.setup_market()
-        
-        asyncio.create_task(self.ws_ticker_loop())
+
         asyncio.create_task(self.ws_user_data_loop())
         asyncio.create_task(self.keepalive_listen_key())
-        
-        has_pos = await self.sync_existing_position()
-        self.startup_sync_complete = True
 
-        if has_pos:
-            self.adopted_existing_position = True
-            self.strategy["state"] = "MONITOR"
-            self.state_manager.save()
-            logger.info("🛡️ СУЩЕСТВУЮЩАЯ ПОЗИЦИЯ ПОДХВАЧЕНА. ДОПОЛНИТЕЛЬНЫЙ ВХОД ЗАПРЕЩЕН.")
-        else:
-            if self.strategy["state"] == "MONITOR":
-                self.strategy.update({
-                    "state": "ENTRY",
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "side": "BUY",
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "last_tp_time": 0.0
-                })
-                self.state_manager.save()
-            await send_tg_async(
-                self.session,
-                f"🤖 <b>БОТ ЗАПУЩЕН</b>\n"
-                f"{self.active_symbol} | Плечо: {LEVERAGE}x\n"
-                f"Старт: {USDT_AMOUNT} {self.quote_asset} | Множитель: {MARTINGALE_MULTIPLIER}x\n"
-                f"MAX_STREAK: {MAX_STREAK} | SL: {STOP_LOSS_PERCENT}%"
-            )
+        curr_price = await self.get_market_data()
+        if curr_price <= 0:
+            logger.error("❌ Не удалось получить цену с биржи для старта")
+            return
 
-        await self.strategy_loop()
+        # Запуск сетки LONG, если еще не активна
+        if not self.state["LONG"]["active"]:
+            await self.place_grid_orders("LONG", curr_price)
 
-    async def strategy_loop(self):
-        while self.is_running:
-            await asyncio.sleep(0.1)
+        # Запуск сетки SHORT, если еще не активна
+        if not self.state["SHORT"]["active"]:
+            await self.place_grid_orders("SHORT", curr_price)
 
-            try:
-                if not self.startup_sync_complete:
-                    continue
+        await send_tg_async(
+            self.session,
+            f"🤖 <b>ДВУСТОРОННИЙ СЕТОЧНЫЙ БОТ УСПЕШНО ЗАПУЩЕН [{self.active_symbol}]</b>\n"
+            f"Плечо: {LEVERAGE}x | Режим: Hedge Mode (LONG + SHORT)\n"
+            f"Объем колена: {ORDER_USDT} USDT | Шагов: 8 (до 15%)"
+        )
 
-                if self.strategy["state"] == "ENTRY":
-                    pos = await self.get_raw_position(retries=3)
-                    if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-                        logger.warning("🛡️ В ENTRY обнаружена существующая позиция. НОВЫЙ MARKET-ОРДЕР НЕ ОТПРАВЛЯЕМ. Подхватываем позицию...")
-                        self.adopted_existing_position = True
-                        await self.sync_existing_position()
-                        continue
-
-                    if self.adopted_existing_position:
-                        pos = await self.get_raw_position(retries=2)
-                        if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-                            logger.warning("🛡️ Подхваченная позиция все еще существует. Вход заблокирован.")
-                            await asyncio.sleep(0.5)
-                            continue
-                        self.adopted_existing_position = False
-
-                    last_price = await self.get_market_data()
-                    if last_price <= 0:
-                        continue
-
-                    last_tp = self.strategy.get("last_tp_time", 0.0)
-                    is_continuation = last_tp > 0 and (time.time() - last_tp < CONTINUATION_TTL_SECONDS)
-
-                    atr_percent, candle_color = await self.get_atr_and_candle_color()
-
-                    if atr_percent < MIN_ATR_PERCENT:
-                        logger.info(f"⏳ Рынок в затишье (ATR {atr_percent:.3f}% < {MIN_ATR_PERCENT}%). Ожидание...")
-                        await asyncio.sleep(10)
-                        continue
-
-                    if is_continuation:
-                        side = self.strategy.get("side", "BUY")
-                        logger.info(f"📈 Продолжение тренда после TP: вход по сохраненному направлению {side}")
-                    else:
-                        if last_tp > 0:
-                            logger.info("⏳ TTL продолжения тренда истек (> 15 мин). Переход к чистому старту по свече.")
-                            self.strategy["last_tp_time"] = 0.0
-                            self.state_manager.save()
-                        
-                        side = candle_color
-                        self.strategy["side"] = side
-                        self.state_manager.save()
-                        logger.info(f"🟢 Чистый старт: направление по цвету свечи => {side}")
-
-                    pos = await self.get_raw_position(retries=2)
-                    if pos and abs(float(pos.get("positionAmt", 0))) > 0:
-                        logger.warning("Позиция уже существует. Синхронизация...")
-                        await self.sync_existing_position()
-                        continue
-
-                    self.strategy["state"] = "PROCESSING"
-                    raw_qty = self.strategy["usdt"] / last_price
-                    qty = format_qty(raw_qty, self.step_size)
-
-                    await self.cancel_all_orders()
-
-                    res = await self._request("POST", "/fapi/v1/order", {
-                        "symbol": self.active_symbol,
-                        "side": side,
-                        "positionSide": "BOTH",
-                        "type": "MARKET",
-                        "quantity": qty,
-                        "newClientOrderId": f"e_{uuid.uuid4().hex[:10]}"
-                    }, signed=True, weight=1)
-
-                    if isinstance(res, dict) and res.get("orderId"):
-                        order_id = res.get("orderId")
-                        entry_price = await self.get_actual_entry_price(order_id, side=side)
-                        if entry_price <= 0:
-                            entry_price = float(res.get("avgPrice", 0))
-                            if entry_price == 0:
-                                entry_price = last_price
-
-                        loss_streak = self.strategy.get("loss_streak", 0)
-                        self.strategy.update({
-                            "entry_price": entry_price,
-                            "qty": qty,
-                            "entry_time": time.time()
-                        })
-                        self.state_manager.save()
-
-                        tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak)
-
-                        self.strategy["state"] = "MONITOR"
-                        self.state_manager.save()
-                        icon = "🟢" if side == "BUY" else "🔻"
-                        current_step = loss_streak + 1
-                        
-                        await send_tg_async(
-                            self.session,
-                            f"{icon} <b>ОТКРЫТА ПОЗИЦИЯ ({side}) [{self.active_symbol}]</b>\n"
-                            f"Цена: {entry_price} | Объем: {qty} {self.base_asset} (~{self.strategy['usdt']} {self.quote_asset})\n"
-                            f"🎯 TP: {tp_price} ({target_percent}%) | 🛑 SL: {sl_price} ({STOP_LOSS_PERCENT}%)\n"
-                            f"Колено: #{current_step}/{MAX_STREAK}"
-                        )
-                    else:
-                        logger.error(f"Ошибка открытия позиции: {res}")
-                        self.strategy["state"] = "ENTRY"
-                        await asyncio.sleep(0.5)
-
-                elif self.strategy["state"] == "MONITOR":
-                    now = time.time()
-                    if now - self.last_pos_check_time > 2.0:
-                        self.last_pos_check_time = now
-                        pos = await self.get_raw_position(retries=2)
-                        if pos is not None:
-                            pos_amt = abs(float(pos.get("positionAmt", 0.0)))
-                            if pos_amt == 0:
-                                logger.info("🔍 Позиция закрыта, запускаем обработку")
-                                if not self.is_processing_close:
-                                    asyncio.create_task(self.handle_position_closed())
-                            else:
-                                self.strategy.update({
-                                    "entry_price": float(pos.get("entryPrice", self.strategy.get("entry_price", 0.0))),
-                                    "qty": abs(float(pos.get("positionAmt", 0.0)))
-                                })
-                                self.state_manager.save()
-
-            except Exception as e:
-                logger.error(f"Ошибка в цикле strategy_loop: {e}")
-                await asyncio.sleep(1)
-
-bot = BinanceMartingaleBot()
+bot = GridHedgeBot()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1177,7 +592,7 @@ async def root():
         "status": "ok",
         "symbol": bot.active_symbol,
         "latest_price": bot.latest_price,
-        "strategy": bot.strategy
+        "state": bot.state
     }
 
 if __name__ == "__main__":
