@@ -23,7 +23,7 @@ except ImportError:
 # =========================================================================
 # ⚙️ ОСНОВНЫЕ НАСТРОЙКИ БОТА
 # =========================================================================
-SYMBOL = os.getenv("SYMBOL", "XRPUSDC").strip()
+SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
 USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 10))
 MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 1))
