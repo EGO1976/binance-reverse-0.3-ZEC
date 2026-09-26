@@ -30,7 +30,7 @@ MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 1))
 MAX_STREAK = int(os.getenv("MAX_STREAK", 500))
 
 # Фиксированный Тейк-Профит в процентах
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.35))
+TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.3))
 
 # Фиксированный Стоп-Лосс в процентах
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.25))
