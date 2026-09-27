@@ -748,6 +748,13 @@ class BinanceMartingaleBot:
         entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
         closing_side = "SELL" if side == "BUY" else "BUY"
 
+        realized = 0.0
+        commission = 0.0
+        exit_qty = 0.0
+        exit_notional = 0.0
+        last_exit_price = exit_price
+        has_exit = False
+
         try:
             res = await self._request("GET", "/fapi/v1/userTrades", {
                 "symbol": self.active_symbol,
@@ -755,13 +762,6 @@ class BinanceMartingaleBot:
                 "limit": 100
             }, signed=True, weight=5)
             if isinstance(res, list):
-                realized = 0.0
-                commission = 0.0
-                exit_qty = 0.0
-                exit_notional = 0.0
-                last_exit_price = exit_price
-                has_exit = False
-
                 for trade in res:
                     t = int(trade.get("time", 0) or 0)
                     if t < max(0, entry_time_ms - 5000):
@@ -780,23 +780,29 @@ class BinanceMartingaleBot:
                             exit_notional += q * px
                             last_exit_price = px
                             has_exit = True
-
-                if (has_exit and abs(realized) > 0) or (has_exit and commission > 0):
-                    avg_exit = exit_notional / exit_qty if exit_qty > 0 else last_exit_price
-                    net = realized - commission
-                    notional = abs(entry_price * qty)
-                    return {
-                        "gross": realized,
-                        "fee": commission,
-                        "net": net,
-                        "percent": (net / notional) * 100 if notional > 0 else 0.0,
-                        "exit_price": avg_exit,
-                        "exit_qty": exit_qty
-                    }
         except Exception as e:
-            logger.error(f"Ошибка расчета реального PnL: {e}")
+            logger.error(f"Ошибка расчета реального PnL через API: {e}")
 
-        return None
+        # Если данные сделок не получены или realizedPnl нулевой, вычисляем точный математический PnL
+        calc_exit_price = (exit_notional / exit_qty) if (has_exit and exit_qty > 0) else (exit_price if exit_price > 0 else (self.strategy.get("tp_price", 0.0) if side == "BUY" else self.strategy.get("sl_price", 0.0)))
+        calc_qty = exit_qty if (has_exit and exit_qty > 0) else qty
+
+        if abs(realized) == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
+            if side == "BUY":
+                realized = (calc_exit_price - entry_price) * calc_qty
+            else:
+                realized = (entry_price - calc_exit_price) * calc_qty
+
+        net = realized - commission
+        notional = abs(entry_price * qty)
+        return {
+            "gross": realized,
+            "fee": commission,
+            "net": net,
+            "percent": (net / notional) * 100 if notional > 0 else 0.0,
+            "exit_price": calc_exit_price if calc_exit_price > 0 else entry_price,
+            "exit_qty": calc_qty
+        }
 
     async def handle_position_closed(self, close_type=None):
         if self.is_processing_close:
