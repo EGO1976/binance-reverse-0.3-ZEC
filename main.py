@@ -25,15 +25,15 @@ except ImportError:
 # =========================================================================
 SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
-USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 10))
-MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 1))
-MAX_STREAK = int(os.getenv("MAX_STREAK", 500))
+USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 100))
+MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.5))
+MAX_STREAK = int(os.getenv("MAX_STREAK", 5))
 
 # Фиксированный Тейк-Профит в процентах
 TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.3))
 
 # Фиксированный Стоп-Лосс в процентах
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.25))
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.3))
 
 # Фильтрация по ATR и TTL продолжения тренда (установлено 5 минут = 300 секунд)
 MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", 0.05))
