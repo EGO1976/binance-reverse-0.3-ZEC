@@ -525,7 +525,8 @@ class BinanceMartingaleBot:
                     "qty": qty,
                     "loss_streak": loss_streak,
                     "state": "MONITOR",
-                    "entry_time": time.time()
+                    "entry_time": time.time(),
+                    "entry_order_id": 0
                 })
                 self.state_manager.save()
 
@@ -711,15 +712,25 @@ class BinanceMartingaleBot:
         return "UNKNOWN", None
 
     async def get_last_closing_trade(self):
+        """
+        Возвращает последний фактический fill, которым была закрыта текущая позиция.
+        ВАЖНО: ищем только после фактического времени входа, чтобы не захватить
+        closing trade предыдущего колена.
+        """
         entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
         side = self.strategy.get("side", "BUY")
         closing_side = "SELL" if side == "BUY" else "BUY"
 
+        if entry_time_ms <= 0:
+            return None
+
         try:
+            # Binance userTrades содержит фактические fills, включая orderId,
+            # price, qty, realizedPnl и commission.
             res = await self._request("GET", "/fapi/v1/userTrades", {
                 "symbol": self.active_symbol,
-                "startTime": max(0, entry_time_ms - 5000),
-                "limit": 100
+                "startTime": entry_time_ms,
+                "limit": 1000
             }, signed=True, weight=5)
             if not isinstance(res, list):
                 return None
@@ -727,81 +738,164 @@ class BinanceMartingaleBot:
             candidates = []
             for trade in res:
                 t = int(trade.get("time", 0) or 0)
-                if t < max(0, entry_time_ms - 5000):
+                if t < entry_time_ms:
                     continue
                 if str(trade.get("side", "")).upper() != closing_side:
                     continue
-                qty = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
-                if qty <= 0:
+                q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
+                if q <= 0:
                     continue
                 candidates.append(trade)
 
             if not candidates:
                 return None
+
             candidates.sort(key=lambda x: int(x.get("time", 0) or 0), reverse=True)
             return candidates[0]
         except Exception as e:
-            logger.error(f"Ошибка получения реального closing trade: {e}")
+            logger.error(f"Ошибка получения фактического closing trade: {e}")
             return None
 
-    async def calculate_realized_pnl(self, entry_price, exit_price, qty, side):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
+    async def _get_trades_for_order(self, order_id, retries=8):
+        """Получает ВСЕ фактические fills конкретного ордера."""
+        if not order_id:
+            return []
+
+        for attempt in range(1, retries + 1):
+            try:
+                res = await self._request("GET", "/fapi/v1/userTrades", {
+                    "symbol": self.active_symbol,
+                    "orderId": int(order_id),
+                    "limit": 1000
+                }, signed=True, weight=5)
+                if isinstance(res, list) and res:
+                    return [t for t in res if int(t.get("orderId", 0) or 0) == int(order_id)]
+            except Exception as e:
+                logger.warning(f"Ошибка получения fills orderId={order_id}, попытка {attempt}: {e}")
+
+            await asyncio.sleep(0.35)
+
+        return []
+
+    async def calculate_realized_pnl(self, entry_price, exit_price, qty, side, close_trade=None):
+        """
+        ТОЛЬКО ФАКТИЧЕСКИЙ PnL. Никаких расчетов по entry/exit price как fallback.
+
+        Gross  = сумма realizedPnl только закрывающих fills.
+        Fee    = фактическая комиссия входа + фактическая комиссия выхода
+                 из userTrades.
+        Net    = Gross - Fee.
+
+        Это соответствует данным Binance userTrades: endpoint возвращает
+        realizedPnl, commission, commissionAsset, price, qty и orderId.
+        """
+        entry_order_id = int(self.strategy.get("entry_order_id", 0) or 0)
+
+        # 1) Точные fills входного MARKET-ордера.
+        entry_trades = await self._get_trades_for_order(entry_order_id) if entry_order_id else []
+
+        # Если позиция была подхвачена после перезапуска, entry_order_id неизвестен.
+        # В этом случае НЕ придумываем PnL и не подставляем математическую оценку.
+        if not entry_trades:
+            logger.warning(
+                f"⚠️ Точные fills входа не найдены (entry_order_id={entry_order_id}). "
+                "Комиссия входа не будет выдумываться."
+            )
+
+        # 2) Определяем реальный closing orderId.
+        if close_trade is None:
+            close_trade = await self.get_last_closing_trade()
+
+        close_order_id = int(close_trade.get("orderId", 0) or 0) if close_trade else 0
+        close_trades = await self._get_trades_for_order(close_order_id) if close_order_id else []
+
+        if not close_trades:
+            logger.warning(
+                f"⚠️ Точные fills закрытия еще не получены (close_order_id={close_order_id}). "
+                "PnL не рассчитываем приблизительно."
+            )
+            return None
+
+        # Защита: в закрывающем ордере должны быть fills противоположной стороны.
         closing_side = "SELL" if side == "BUY" else "BUY"
+        close_trades = [
+            t for t in close_trades
+            if str(t.get("side", "")).upper() == closing_side
+        ]
+        if not close_trades:
+            logger.warning("⚠️ В closing order нет fills нужной стороны.")
+            return None
 
-        realized = 0.0
-        commission = 0.0
-        exit_qty = 0.0
-        exit_notional = 0.0
-        last_exit_price = exit_price
-        has_exit = False
+        # Gross PnL — Binance realizedPnl по каждому фактическому закрывающему fill.
+        gross = sum(float(t.get("realizedPnl", 0) or 0) for t in close_trades)
 
-        try:
-            res = await self._request("GET", "/fapi/v1/userTrades", {
-                "symbol": self.active_symbol,
-                "startTime": max(0, entry_time_ms - 5000),
-                "limit": 100
-            }, signed=True, weight=5)
-            if isinstance(res, list):
-                for trade in res:
-                    t = int(trade.get("time", 0) or 0)
-                    if t < max(0, entry_time_ms - 5000):
-                        continue
-                    trade_side = str(trade.get("side", "")).upper()
-                    rp = float(trade.get("realizedPnl", 0) or 0)
-                    comm = float(trade.get("commission", 0) or 0)
-                    commission += abs(comm)
-                    realized += rp
+        # Комиссии — только реальные значения commission из userTrades.
+        # Не используем фиксированный процент комиссии.
+        entry_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in entry_trades)
+        close_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in close_trades)
 
-                    if trade_side == closing_side:
-                        q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
-                        px = float(trade.get("price", 0) or 0)
-                        if q > 0 and px > 0:
-                            exit_qty += q
-                            exit_notional += q * px
-                            last_exit_price = px
-                            has_exit = True
-        except Exception as e:
-            logger.error(f"Ошибка расчета реального PnL через API: {e}")
+        # Для USDC-M фьючерсов комиссия должна быть в margin asset (USDC).
+        # Если Binance вернул другой commissionAsset, не превращаем его
+        # искусственно в USDC — явно помечаем это в логах.
+        fee_assets = sorted({
+            str(t.get("commissionAsset", ""))
+            for t in (entry_trades + close_trades)
+            if t.get("commissionAsset")
+        })
 
-        # Если данные сделок не получены или realizedPnl нулевой, вычисляем точный математический PnL
-        calc_exit_price = (exit_notional / exit_qty) if (has_exit and exit_qty > 0) else (exit_price if exit_price > 0 else (self.strategy.get("tp_price", 0.0) if side == "BUY" else self.strategy.get("sl_price", 0.0)))
-        calc_qty = exit_qty if (has_exit and exit_qty > 0) else qty
+        if fee_assets and any(asset not in {"USDC", ""} for asset in fee_assets):
+            logger.warning(
+                f"⚠️ Комиссия пришла не только в USDC: {fee_assets}. "
+                "Значения не конвертируются искусственно."
+            )
 
-        if abs(realized) == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
-            if side == "BUY":
-                realized = (calc_exit_price - entry_price) * calc_qty
-            else:
-                realized = (entry_price - calc_exit_price) * calc_qty
+        total_fee = entry_fee + close_fee
+        net = gross - total_fee
 
-        net = realized - commission
-        notional = abs(entry_price * qty)
+        # Фактический средний exit price и объем по fills.
+        exit_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in close_trades)
+        exit_notional = sum(
+            abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
+            float(t.get("price", 0) or 0)
+            for t in close_trades
+        )
+        actual_exit_price = exit_notional / exit_qty if exit_qty > 0 else 0.0
+
+        # Фактический входной notional — из fills, а не из заданного USDT_AMOUNT.
+        entry_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in entry_trades)
+        entry_notional = sum(
+            abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
+            float(t.get("price", 0) or 0)
+            for t in entry_trades
+        )
+
+        if entry_notional <= 0:
+            # Для подхваченной позиции можем показать процент только если есть
+            # сохраненный реальный entryPrice, но сам USDC PnL остается строго API-based.
+            entry_notional = abs(entry_price * (exit_qty if exit_qty > 0 else qty))
+
+        percent = (net / entry_notional) * 100 if entry_notional > 0 else 0.0
+
+        logger.info(
+            f"💰 ФАКТИЧЕСКИЙ PnL: gross={gross:.8f} | "
+            f"entry_fee={entry_fee:.8f} | close_fee={close_fee:.8f} | "
+            f"net={net:.8f} | entry_order={entry_order_id} | close_order={close_order_id}"
+        )
+
         return {
-            "gross": realized,
-            "fee": commission,
+            "gross": gross,
+            "entry_fee": entry_fee,
+            "close_fee": close_fee,
+            "fee": total_fee,
             "net": net,
-            "percent": (net / notional) * 100 if notional > 0 else 0.0,
-            "exit_price": calc_exit_price if calc_exit_price > 0 else entry_price,
-            "exit_qty": calc_qty
+            "percent": percent,
+            "exit_price": actual_exit_price,
+            "exit_qty": exit_qty,
+            "entry_qty": entry_qty,
+            "entry_notional": entry_notional,
+            "close_order_id": close_order_id,
+            "entry_order_id": entry_order_id,
+            "fee_assets": fee_assets
         }
 
     async def handle_position_closed(self, close_type=None):
@@ -845,7 +939,8 @@ class BinanceMartingaleBot:
                 entry_price,
                 float(close_trade.get("price", 0)) if close_trade else 0.0,
                 qty,
-                side
+                side,
+                close_trade=close_trade
             )
             
             if close_type == "TP":
@@ -856,7 +951,8 @@ class BinanceMartingaleBot:
                 if pnl_data:
                     sign = "+" if pnl_data["net"] >= 0 else ""
                     msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} USDC\n"
+                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
+                    msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC\n"
                     msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
                 else:
                     msg += "📊 PnL: данные Binance еще не получены"
@@ -867,6 +963,7 @@ class BinanceMartingaleBot:
                     "loss_streak": 0,
                     "qty": 0.0,
                     "entry_price": 0.0,
+                    "entry_order_id": 0,
                     "tp_order_id": 0,
                     "tp_client_id": "",
                     "sl_algo_id": 0,
@@ -879,6 +976,24 @@ class BinanceMartingaleBot:
                 self.state_manager.save()
                 
             elif close_type == "SL":
+                current_step = loss_streak + 1
+                if pnl_data:
+                    sign = "+" if pnl_data["net"] >= 0 else ""
+                    sl_msg = f"🛑 <b>СТОП-ЛОСС!</b> ({self.active_symbol})\n"
+                    sl_msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
+                    sl_msg += f"Направление: {side}\n"
+                    sl_msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
+                    sl_msg += f"📉 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
+                    sl_msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC"
+                    await send_tg_async(self.session, sl_msg)
+                else:
+                    await send_tg_async(
+                        self.session,
+                        f"🛑 <b>СТОП-ЛОСС!</b> ({self.active_symbol})\n"
+                        "⚠️ Точные fills Binance еще не получены — PnL НЕ подменен расчетом по цене. "
+                        "Переворот выполняется по обычной логике."
+                    )
+
                 next_streak = loss_streak + 1
                 if next_streak >= MAX_STREAK:
                     self.strategy.update({
@@ -888,6 +1003,7 @@ class BinanceMartingaleBot:
                         "side": "BUY",
                         "qty": 0.0,
                         "entry_price": 0.0,
+                        "entry_order_id": 0,
                         "last_tp_time": 0.0
                     })
                     self.state_manager.save()
@@ -922,6 +1038,7 @@ class BinanceMartingaleBot:
                     "side": "BUY",
                     "qty": 0.0,
                     "entry_price": 0.0,
+                    "entry_order_id": 0,
                     "last_tp_time": 0.0
                 })
                 self.state_manager.save()
@@ -966,7 +1083,8 @@ class BinanceMartingaleBot:
                 "usdt": next_usdt,
                 "qty": new_qty,
                 "entry_price": entry_price,
-                "entry_time": time.time()
+                "entry_time": time.time(),
+                "entry_order_id": int(order_id)
             })
             self.state_manager.save()
 
@@ -1018,6 +1136,7 @@ class BinanceMartingaleBot:
                     "side": "BUY",
                     "qty": 0.0,
                     "entry_price": 0.0,
+                    "entry_order_id": 0,
                     "last_tp_time": 0.0
                 })
                 self.state_manager.save()
@@ -1116,7 +1235,8 @@ class BinanceMartingaleBot:
                         self.strategy.update({
                             "entry_price": entry_price,
                             "qty": qty,
-                            "entry_time": time.time()
+                            "entry_time": time.time(),
+                            "entry_order_id": int(order_id)
                         })
                         self.state_manager.save()
 
