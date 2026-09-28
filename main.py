@@ -308,7 +308,7 @@ class BinanceMartingaleBot:
             return self.latest_price
         return 0.0
 
-    async def get_bnb_price((self) -> float:
+    async def get_bnb_price(self) -> float:
         try:
             res = await self._request("GET", "/fapi/v1/ticker/price", {"symbol": "BNBUSDT"}, weight=1)
             if isinstance(res, dict) and "price" in res:
@@ -768,7 +768,6 @@ class BinanceMartingaleBot:
         bnb_price = 0.0
 
         try:
-            # Расширяем интервал поиска назад на 60 секунд на случай рассинхрона времени
             start_search_time = max(0, entry_time_ms - 60000)
             res = await self._request("GET", "/fapi/v1/userTrades", {
                 "symbol": self.active_symbol,
@@ -787,7 +786,6 @@ class BinanceMartingaleBot:
                     comm = float(trade.get("commission", 0) or 0)
                     comm_asset = str(trade.get("commissionAsset", "")).upper()
 
-                    # Точный пересчет комиссий в валюту котировки (USDC/USDT)
                     if comm > 0:
                         if comm_asset == quote_asset:
                             commission += comm
@@ -816,25 +814,21 @@ class BinanceMartingaleBot:
         except Exception as e:
             logger.error(f"Ошибка расчета реального PnL через API: {e}")
 
-        # Рассчитываем среднюю цену и объем закрытия
         calc_exit_price = (exit_notional / exit_qty) if (has_exit and exit_qty > 0) else (exit_price if exit_price > 0 else (self.strategy.get("tp_price", 0.0) if side == "BUY" else self.strategy.get("sl_price", 0.0)))
         calc_qty = exit_qty if (has_exit and exit_qty > 0) else qty
 
-        # Если realizedPnl из API равен 0 (например, при задержке данных), вычисляем точный PnL по ценам
         if abs(realized) == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
             if side == "BUY":
                 realized = (calc_exit_price - entry_price) * calc_qty
             else:
                 realized = (entry_price - calc_exit_price) * calc_qty
 
-        # Оценка и учет комиссий, если сделки не были получены или сделка входа произошла ранее окна поиска
         if commission == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
             entry_fee = entry_price * calc_qty * 0.0005
             exit_fee_rate = 0.0002 if abs(calc_exit_price - float(self.strategy.get("tp_price", 0.0) or 0)) < abs(calc_exit_price - float(self.strategy.get("sl_price", 0.0) or 0)) else 0.0005
             exit_fee = calc_exit_price * calc_qty * exit_fee_rate
             commission = entry_fee + exit_fee
         elif not has_entry and entry_price > 0 and calc_qty > 0:
-            # Если входная сделка осталась за пределами таймфрейма userTrades, добавляем комиссию открытия
             commission += entry_price * calc_qty * 0.0005
 
         net = realized - commission
