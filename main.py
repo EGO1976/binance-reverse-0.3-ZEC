@@ -308,6 +308,15 @@ class BinanceMartingaleBot:
             return self.latest_price
         return 0.0
 
+    async def get_bnb_price((self) -> float:
+        try:
+            res = await self._request("GET", "/fapi/v1/ticker/price", {"symbol": "BNBUSDT"}, weight=1)
+            if isinstance(res, dict) and "price" in res:
+                return float(res["price"])
+        except Exception:
+            pass
+        return 0.0
+
     async def get_raw_position(self, retries=2):
         for attempt in range(retries):
             res = await self._request("GET", "/fapi/v2/positionRisk", {"symbol": self.active_symbol}, signed=True, weight=5)
@@ -746,31 +755,56 @@ class BinanceMartingaleBot:
 
     async def calculate_realized_pnl(self, entry_price, exit_price, qty, side):
         entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
+        quote_asset = "USDC" if "USDC" in self.active_symbol else "USDT"
         closing_side = "SELL" if side == "BUY" else "BUY"
 
         realized = 0.0
         commission = 0.0
         exit_qty = 0.0
         exit_notional = 0.0
-        last_exit_price = exit_price
         has_exit = False
+        has_entry = False
+
+        bnb_price = 0.0
 
         try:
+            # Расширяем интервал поиска назад на 60 секунд на случай рассинхрона времени
+            start_search_time = max(0, entry_time_ms - 60000)
             res = await self._request("GET", "/fapi/v1/userTrades", {
                 "symbol": self.active_symbol,
-                "startTime": max(0, entry_time_ms - 5000),
+                "startTime": start_search_time,
                 "limit": 100
             }, signed=True, weight=5)
-            if isinstance(res, list):
+            
+            if isinstance(res, list) and len(res) > 0:
                 for trade in res:
                     t = int(trade.get("time", 0) or 0)
-                    if t < max(0, entry_time_ms - 5000):
+                    if t < start_search_time:
                         continue
+                    
                     trade_side = str(trade.get("side", "")).upper()
                     rp = float(trade.get("realizedPnl", 0) or 0)
                     comm = float(trade.get("commission", 0) or 0)
-                    commission += abs(comm)
+                    comm_asset = str(trade.get("commissionAsset", "")).upper()
+
+                    # Точный пересчет комиссий в валюту котировки (USDC/USDT)
+                    if comm > 0:
+                        if comm_asset == quote_asset:
+                            commission += comm
+                        elif comm_asset == "BNB":
+                            if bnb_price == 0.0:
+                                bnb_price = await self.get_bnb_price()
+                            if bnb_price > 0:
+                                commission += comm * bnb_price
+                            else:
+                                commission += comm
+                        else:
+                            commission += comm
+
                     realized += rp
+
+                    if trade_side == side:
+                        has_entry = True
 
                     if trade_side == closing_side:
                         q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
@@ -778,35 +812,43 @@ class BinanceMartingaleBot:
                         if q > 0 and px > 0:
                             exit_qty += q
                             exit_notional += q * px
-                            last_exit_price = px
                             has_exit = True
         except Exception as e:
             logger.error(f"Ошибка расчета реального PnL через API: {e}")
 
+        # Рассчитываем среднюю цену и объем закрытия
         calc_exit_price = (exit_notional / exit_qty) if (has_exit and exit_qty > 0) else (exit_price if exit_price > 0 else (self.strategy.get("tp_price", 0.0) if side == "BUY" else self.strategy.get("sl_price", 0.0)))
         calc_qty = exit_qty if (has_exit and exit_qty > 0) else qty
 
-        # Расчет валовой прибыли (Gross) от разницы цен
-        if side == "BUY":
-            gross = (calc_exit_price - entry_price) * calc_qty
-        else:
-            gross = (entry_price - calc_exit_price) * calc_qty
+        # Если realizedPnl из API равен 0 (например, при задержке данных), вычисляем точный PnL по ценам
+        if abs(realized) == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
+            if side == "BUY":
+                realized = (calc_exit_price - entry_price) * calc_qty
+            else:
+                realized = (entry_price - calc_exit_price) * calc_qty
 
-        # Если комиссии с API не получены (0.0), учитываем 0.04% за вход/переворот
-        if commission == 0.0:
-            commission = abs(entry_price * calc_qty) * 0.0004
+        # Оценка и учет комиссий, если сделки не были получены или сделка входа произошла ранее окна поиска
+        if commission == 0.0 and entry_price > 0 and calc_exit_price > 0 and calc_qty > 0:
+            entry_fee = entry_price * calc_qty * 0.0005
+            exit_fee_rate = 0.0002 if abs(calc_exit_price - float(self.strategy.get("tp_price", 0.0) or 0)) < abs(calc_exit_price - float(self.strategy.get("sl_price", 0.0) or 0)) else 0.0005
+            exit_fee = calc_exit_price * calc_qty * exit_fee_rate
+            commission = entry_fee + exit_fee
+        elif not has_entry and entry_price > 0 and calc_qty > 0:
+            # Если входная сделка осталась за пределами таймфрейма userTrades, добавляем комиссию открытия
+            commission += entry_price * calc_qty * 0.0005
 
-        # Реализованный чистый PnL с биржи или за вычетом комиссий
-        net = realized if abs(realized) > 0.0 else (gross - commission)
-        notional = abs(entry_price * qty)
+        net = realized - commission
+        notional = abs(entry_price * calc_qty)
+        percent = (net / notional) * 100.0 if notional > 0 else 0.0
 
         return {
-            "gross": gross,
+            "gross": realized,
             "fee": commission,
             "net": net,
-            "percent": (net / notional) * 100 if notional > 0 else 0.0,
+            "percent": percent,
             "exit_price": calc_exit_price if calc_exit_price > 0 else entry_price,
-            "exit_qty": calc_qty
+            "exit_qty": calc_qty,
+            "quote_asset": quote_asset
         }
 
     async def handle_position_closed(self, close_type=None):
@@ -855,16 +897,16 @@ class BinanceMartingaleBot:
             
             if close_type == "TP":
                 current_step = loss_streak + 1
+                quote = pnl_data.get("quote_asset", "USDC")
+                sign = "+" if pnl_data["net"] >= 0 else ""
+                
                 msg = f"✅ <b>ТЕЙК-ПРОФИТ!</b> ({self.active_symbol})\n"
                 msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
                 msg += f"Направление: {side}\n"
-                if pnl_data:
-                    sign = "+" if pnl_data["net"] >= 0 else ""
-                    msg += f"💰 Net PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} USDC\n"
-                    msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
-                else:
-                    msg += "📊 PnL: данные Binance еще не получены"
+                msg += f"💰 PnL (чистый): <b>{sign}{pnl_data['net']:.2f} {quote}</b> ({sign}{pnl_data['percent']:.2f}%)\n"
+                msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {sign}{pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} {quote}\n"
+                msg += f"💳 Баланс: {await self.get_free_margin():.2f} {quote}"
+                
                 await send_tg_async(self.session, msg)
                 
                 self.strategy.update({
@@ -885,7 +927,20 @@ class BinanceMartingaleBot:
                 
             elif close_type == "SL":
                 next_streak = loss_streak + 1
+                quote = pnl_data.get("quote_asset", "USDC")
+                sign = "+" if pnl_data["net"] >= 0 else ""
+
                 if next_streak >= MAX_STREAK:
+                    await send_tg_async(
+                        self.session,
+                        f"🛑 <b>СТОП-ЛОСС! ДОСТИГНУТ ЛИМИТ КОЛЕН ({MAX_STREAK})</b> ({self.active_symbol})\n"
+                        f"Колено: #{loss_streak + 1}/{MAX_STREAK}\n"
+                        f"Направление: {side}\n"
+                        f"💸 PnL (чистый): <b>{sign}{pnl_data['net']:.2f} {quote}</b> ({sign}{pnl_data['percent']:.2f}%)\n"
+                        f"📊 Gross: {sign}{pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} {quote}\n"
+                        f"💳 Баланс: {await self.get_free_margin():.2f} {quote}\n"
+                        f"🔄 Сброс серии и возврат к начальному состоянию."
+                    )
                     self.strategy.update({
                         "state": "ENTRY",
                         "loss_streak": 0,
@@ -910,7 +965,7 @@ class BinanceMartingaleBot:
                     await asyncio.sleep(0.5)
                     pos = await self.get_raw_position(retries=2)
                 
-                success = await self.execute_flip(side, next_usdt, next_streak)
+                success = await self.execute_flip(side, next_usdt, next_streak, pnl_data=pnl_data)
                 if success:
                     self.strategy["state"] = "MONITOR"
                 else:
@@ -933,7 +988,7 @@ class BinanceMartingaleBot:
         finally:
             self.is_processing_close = False
 
-    async def execute_flip(self, current_side, next_usdt, loss_streak):
+    async def execute_flip(self, current_side, next_usdt, loss_streak, pnl_data=None):
         new_side = "SELL" if current_side == "BUY" else "BUY"
         last_price = await self.get_market_data()
         if last_price <= 0:
@@ -982,9 +1037,19 @@ class BinanceMartingaleBot:
             sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
             coin = self.get_coin_name()
             
+            sl_pnl_str = ""
+            if pnl_data:
+                quote = pnl_data.get("quote_asset", "USDC")
+                sign = "+" if pnl_data["net"] >= 0 else ""
+                sl_pnl_str = (
+                    f"💸 PnL прошлого SL: <b>{sign}{pnl_data['net']:.2f} {quote} ({sign}{pnl_data['percent']:.2f}%)</b>\n"
+                    f"📊 Gross: {sign}{pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} {quote}\n"
+                )
+
             await send_tg_async(
                 self.session,
                 f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ! ({self.active_symbol})</b>\n"
+                f"{sl_pnl_str}"
                 f"{current_side} → {new_side}\n"
                 f"Вход: {formatted_entry} | Объем: {new_qty} {coin} (~{next_usdt} USDC)\n"
                 f"🎯 TP: {tp_price} ({target_percent}%) | {sl_display}\n"
