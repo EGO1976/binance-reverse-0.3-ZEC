@@ -752,64 +752,61 @@ class BinanceMartingaleBot:
         commission = 0.0
         exit_qty = 0.0
         exit_notional = 0.0
-        has_trades = False
+        last_exit_price = exit_price
+        has_exit = False
 
-        # Делаем до 5 попыток с задержкой 0.2с, пока Binance скомпилирует отчёт о сделках
-        for attempt in range(5):
-            try:
-                res = await self._request("GET", "/fapi/v1/userTrades", {
-                    "symbol": self.active_symbol,
-                    "startTime": max(0, entry_time_ms - 1000),
-                    "limit": 50
-                }, signed=True, weight=5)
-                
-                if isinstance(res, list) and len(res) > 0:
-                    realized = 0.0
-                    commission = 0.0
-                    exit_qty = 0.0
-                    exit_notional = 0.0
-                    
-                    for trade in res:
-                        trade_side = str(trade.get("side", "")).upper()
-                        if trade_side == closing_side:
-                            has_trades = True
-                            q = abs(float(trade.get("qty", 0) or 0))
-                            px = float(trade.get("price", 0) or 0)
-                            comm = float(trade.get("commission", 0) or 0)
-                            rp = float(trade.get("realizedPnl", 0) or 0)
-                            
-                            realized += rp
-                            commission += comm
+        try:
+            res = await self._request("GET", "/fapi/v1/userTrades", {
+                "symbol": self.active_symbol,
+                "startTime": max(0, entry_time_ms - 5000),
+                "limit": 100
+            }, signed=True, weight=5)
+            if isinstance(res, list):
+                for trade in res:
+                    t = int(trade.get("time", 0) or 0)
+                    if t < max(0, entry_time_ms - 5000):
+                        continue
+                    trade_side = str(trade.get("side", "")).upper()
+                    rp = float(trade.get("realizedPnl", 0) or 0)
+                    comm = float(trade.get("commission", 0) or 0)
+                    commission += abs(comm)
+                    realized += rp
+
+                    if trade_side == closing_side:
+                        q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
+                        px = float(trade.get("price", 0) or 0)
+                        if q > 0 and px > 0:
                             exit_qty += q
                             exit_notional += q * px
-                            
-                    if has_trades and exit_qty > 0:
-                        break
-            except Exception as e:
-                logger.error(f"Ошибка вызова userTrades для PnL: {e}")
-            await asyncio.sleep(0.2)
+                            last_exit_price = px
+                            has_exit = True
+        except Exception as e:
+            logger.error(f"Ошибка расчета реального PnL через API: {e}")
 
-        weighted_exit_price = (exit_notional / exit_qty) if (has_trades and exit_qty > 0) else exit_price
-        actual_qty = exit_qty if (has_trades and exit_qty > 0) else qty
+        calc_exit_price = (exit_notional / exit_qty) if (has_exit and exit_qty > 0) else (exit_price if exit_price > 0 else (self.strategy.get("tp_price", 0.0) if side == "BUY" else self.strategy.get("sl_price", 0.0)))
+        calc_qty = exit_qty if (has_exit and exit_qty > 0) else qty
 
-        # Если realizedPnl равен 0 (бывает при перевороте или ошибке API), рассчитываем по фактическим ценам сделок
-        if abs(realized) == 0.0 and entry_price > 0 and weighted_exit_price > 0 and actual_qty > 0:
-            if side == "BUY":
-                realized = (weighted_exit_price - entry_price) * actual_qty
-            else:
-                realized = (entry_price - weighted_exit_price) * actual_qty
+        # Расчет валовой прибыли (Gross) от разницы цен
+        if side == "BUY":
+            gross = (calc_exit_price - entry_price) * calc_qty
+        else:
+            gross = (entry_price - calc_exit_price) * calc_qty
 
-        net = realized - commission
-        notional = abs(entry_price * actual_qty)
-        percent = (net / notional) * 100.0 if notional > 0 else 0.0
+        # Если комиссии с API не получены (0.0), учитываем 0.04% за вход/переворот
+        if commission == 0.0:
+            commission = abs(entry_price * calc_qty) * 0.0004
+
+        # Реализованный чистый PnL с биржи или за вычетом комиссий
+        net = realized if abs(realized) > 0.0 else (gross - commission)
+        notional = abs(entry_price * qty)
 
         return {
-            "gross": realized,
+            "gross": gross,
             "fee": commission,
             "net": net,
-            "percent": percent,
-            "exit_price": weighted_exit_price,
-            "exit_qty": actual_qty
+            "percent": (net / notional) * 100 if notional > 0 else 0.0,
+            "exit_price": calc_exit_price if calc_exit_price > 0 else entry_price,
+            "exit_qty": calc_qty
         }
 
     async def handle_position_closed(self, close_type=None):
@@ -863,7 +860,7 @@ class BinanceMartingaleBot:
                 msg += f"Направление: {side}\n"
                 if pnl_data:
                     sign = "+" if pnl_data["net"] >= 0 else ""
-                    msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
+                    msg += f"💰 Net PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
                     msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} | Комиссия: {pnl_data['fee']:.2f} USDC\n"
                     msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
                 else:
