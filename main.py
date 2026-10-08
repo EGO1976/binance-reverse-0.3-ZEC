@@ -24,8 +24,8 @@ except ImportError:
 # ⚙️ ОСНОВНЫЕ НАСТРОЙКИ БОТА
 # =========================================================================
 SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
-LEVERAGE = int(os.getenv("LEVERAGE", 20))
-USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 40))
+LEVERAGE = int(os.getenv("LEVERAGE", 50))
+USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 100))
 MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.5))
 MAX_STREAK = int(os.getenv("MAX_STREAK", 5))
 
