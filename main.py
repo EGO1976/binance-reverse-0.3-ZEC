@@ -25,7 +25,7 @@ except ImportError:
 # =========================================================================
 SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
 LEVERAGE = int(os.getenv("LEVERAGE", 50))
-USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 100))
+USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 40))
 MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.5))
 MAX_STREAK = int(os.getenv("MAX_STREAK", 5))
 
