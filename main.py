@@ -159,6 +159,7 @@ class StateManager:
             "sl_price": 0.0,
             "avg_limit_order_id": 0,
             "avg_limit_client_id": "",
+            "avg_limit_price": 0.0,
             "is_averaged": False
         }
         self.load()
@@ -496,7 +497,7 @@ class BinanceMartingaleBot:
             self.strategy["tp_order_id"] = int(tp_res.get("orderId", 0))
             self.strategy["tp_client_id"] = tp_client_id
 
-        # Выставление лимитного ордера на усреднение для 5-го колена (если еще не усреднено)
+        # Выставление лимитного ордера усреднения для 5-го колена
         if loss_streak == MAX_STREAK - 1 and not is_averaged:
             await self.place_averaging_limit_order(side, qty, entry_price)
 
@@ -537,17 +538,12 @@ class BinanceMartingaleBot:
             self.strategy.update({
                 "avg_limit_order_id": order_id,
                 "avg_limit_client_id": client_avg_id,
+                "avg_limit_price": float(formatted_avg_price),
                 "is_averaged": False
             })
             self.state_manager.save()
             coin = self.get_coin_name()
             logger.info(f"📌 Лимитный ордер усреднения 5-го колена выставлен: {side} {qty} {coin} по цене {formatted_avg_price} (-10%)")
-            await send_tg_async(
-                self.session,
-                f"📌 <b>ВЫСТАВЛЕН ЛИМИТ УСРЕДНЕНИЯ (5-е колено)</b>\n"
-                f"Цена ордера: <b>{formatted_avg_price}</b> (±{AVG_LIMIT_OFFSET_PERCENT}%)\n"
-                f"Объем: {qty} {coin}"
-            )
 
     async def handle_averaging_executed(self):
         """Вызывается при исполнении лимитного ордера усреднения"""
@@ -593,7 +589,7 @@ class BinanceMartingaleBot:
             f"🎯 <b>ПОЗИЦИЯ УСРЕДНЕНА! ({self.active_symbol})</b>\n"
             f"Новая ТВХ: <b>{formatted_entry}</b>\n"
             f"Новый общий объем: <b>{new_qty} {coin}</b>\n"
-            f"🎯 Новый TP (1.5%): <b>{tp_price}</b>\n"
+            f"🎯 Новый TP ({AVG_TAKE_PROFIT_PERCENT}%): <b>{tp_price}</b>\n"
             f"🛑 Стоп-Лосс: <b>ОТКЛЮЧЕН</b>"
         )
 
@@ -617,7 +613,6 @@ class BinanceMartingaleBot:
                 
                 loss_streak = min(calculated_streak, MAX_STREAK - 1)
                 
-                # Проверяем, усреднена ли уже позиция на 5-м колене по объему
                 is_averaged = self.strategy.get("is_averaged", False)
                 if loss_streak == MAX_STREAK - 1:
                     base_5th_usdt = USDT_AMOUNT * (MARTINGALE_MULTIPLIER ** (MAX_STREAK - 1))
@@ -1015,6 +1010,7 @@ class BinanceMartingaleBot:
             entry_price = float(self.strategy.get("entry_price", 0) or 0)
             qty = float(self.strategy.get("qty", 0) or 0)
             loss_streak = self.strategy.get("loss_streak", 0)
+            was_averaged = self.strategy.get("is_averaged", False)
 
             pnl_data = await self.calculate_realized_pnl(
                 entry_price,
@@ -1026,17 +1022,33 @@ class BinanceMartingaleBot:
             
             if close_type == "TP":
                 current_step = loss_streak + 1
-                msg = f"✅ <b>ТЕЙК-ПРОФИТ!</b> ({self.active_symbol})\n"
-                msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
-                msg += f"Направление: {side}\n"
-                if pnl_data:
-                    sign = "+" if pnl_data["net"] >= 0 else ""
-                    msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                    msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
-                    msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC\n"
-                    msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
+                coin = self.get_coin_name()
+                
+                # Отдельное уникальное сообщение при закрытии по Тейк-Профиту ПОСЛЕ УСРЕДНЕНИЯ
+                if was_averaged:
+                    msg = f"🎉 <b>ТЕЙК-ПРОФИТ ПОСЛЕ УСРЕДНЕНИЯ!</b> ({self.active_symbol})\n"
+                    msg += f"Закрыта усредненная позиция на 5-м колене\n"
+                    msg += f"Направление: <b>{side}</b> | Объем: <b>{qty} {coin}</b>\n"
+                    if pnl_data:
+                        sign = "+" if pnl_data["net"] >= 0 else ""
+                        msg += f"💰 Итоговый PnL: <b>{sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)</b>\n"
+                        msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
+                        msg += f"💸 Комиссии: вход {pnl_data['entry_fee']:.4f} | выход {pnl_data['close_fee']:.4f}\n"
+                    msg += f"💳 Баланс: <b>{await self.get_free_margin():.2f} USDC</b>"
                 else:
-                    msg += "📊 PnL: данные Binance еще не получены"
+                    # Стандартное сообщение для обычного закрытия по TP
+                    msg = f"✅ <b>ТЕЙК-ПРОФИТ!</b> ({self.active_symbol})\n"
+                    msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
+                    msg += f"Направление: {side}\n"
+                    if pnl_data:
+                        sign = "+" if pnl_data["net"] >= 0 else ""
+                        msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
+                        msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
+                        msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC\n"
+                        msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
+                    else:
+                        msg += "📊 PnL: данные Binance еще не получены"
+                
                 await send_tg_async(self.session, msg)
                 
                 self.strategy.update({
@@ -1051,6 +1063,7 @@ class BinanceMartingaleBot:
                     "sl_client_algo_id": "",
                     "avg_limit_order_id": 0,
                     "avg_limit_client_id": "",
+                    "avg_limit_price": 0.0,
                     "is_averaged": False,
                     "tp_price": 0.0,
                     "sl_price": 0.0,
@@ -1090,6 +1103,7 @@ class BinanceMartingaleBot:
                         "entry_order_id": 0,
                         "avg_limit_order_id": 0,
                         "avg_limit_client_id": "",
+                        "avg_limit_price": 0.0,
                         "is_averaged": False,
                         "last_tp_time": 0.0
                     })
@@ -1128,6 +1142,7 @@ class BinanceMartingaleBot:
                     "entry_order_id": 0,
                     "avg_limit_order_id": 0,
                     "avg_limit_client_id": "",
+                    "avg_limit_price": 0.0,
                     "is_averaged": False,
                     "last_tp_time": 0.0
                 })
@@ -1186,13 +1201,19 @@ class BinanceMartingaleBot:
             sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
             coin = self.get_coin_name()
             
+            # Если это 5-е колено, сразу добавляем в сообщение инфо про выставляемый лимит усреднения
+            avg_limit_text = ""
+            if loss_streak == MAX_STREAK - 1:
+                avg_price = float(self.strategy.get("avg_limit_price", 0.0))
+                avg_limit_text = f"\n📌 <b>Усреднение:</b> Выставлен LIMIT ордер {new_qty} {coin} по {avg_price} (±{AVG_LIMIT_OFFSET_PERCENT}%)"
+
             await send_tg_async(
                 self.session,
                 f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ! ({self.active_symbol})</b>\n"
                 f"{current_side} → {new_side}\n"
                 f"Вход: {formatted_entry} | Объем: {new_qty} {coin} (~{next_usdt} USDC)\n"
                 f"🎯 TP: {tp_price} ({target_percent}%) | {sl_display}\n"
-                f"Колено: #{current_step}/{MAX_STREAK}"
+                f"Колено: #{current_step}/{MAX_STREAK}{avg_limit_text}"
             )
             return True
         else:
@@ -1230,6 +1251,7 @@ class BinanceMartingaleBot:
                     "entry_order_id": 0,
                     "avg_limit_order_id": 0,
                     "avg_limit_client_id": "",
+                    "avg_limit_price": 0.0,
                     "is_averaged": False,
                     "last_tp_time": 0.0
                 })
@@ -1345,12 +1367,18 @@ class BinanceMartingaleBot:
                         sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
                         coin = self.get_coin_name()
                         
+                        # Сообщение в TG с информацией о выставляемом лимитнике для 5-го колена
+                        avg_limit_text = ""
+                        if loss_streak == MAX_STREAK - 1:
+                            avg_price = float(self.strategy.get("avg_limit_price", 0.0))
+                            avg_limit_text = f"\n📌 <b>Усреднение:</b> Выставлен LIMIT ордер {qty} {coin} по {avg_price} (±{AVG_LIMIT_OFFSET_PERCENT}%)"
+
                         await send_tg_async(
                             self.session,
                             f"{icon} <b>ОТКРЫТА ПОЗИЦИЯ ({side}) — {self.active_symbol}</b>\n"
                             f"Цена: {entry_price} | Объем: {qty} {coin} (~{self.strategy['usdt']} USDC)\n"
                             f"🎯 TP: {tp_price} ({target_percent}%) | {sl_display}\n"
-                            f"Колено: #{current_step}/{MAX_STREAK}"
+                            f"Колено: #{current_step}/{MAX_STREAK}{avg_limit_text}"
                         )
                     else:
                         logger.error(f"Ошибка открытия позиции: {res}")
@@ -1374,7 +1402,6 @@ class BinanceMartingaleBot:
                                 saved_qty = float(self.strategy.get("qty", 0.0))
                                 is_averaged = self.strategy.get("is_averaged", False)
 
-                                # Детект исполнения лимитного ордера / ручного сдвига лимитника на графике
                                 if not is_averaged and self.strategy.get("loss_streak", 0) == MAX_STREAK - 1:
                                     if pos_amt > saved_qty * 1.1 or (saved_entry_price > 0 and abs(current_entry_price - saved_entry_price) / saved_entry_price > 0.01):
                                         logger.info("🔍 Обнаружено изменение объема/ТВХ на 5-м колене (исполнен/передвинут лимитник)")
