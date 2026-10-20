@@ -39,6 +39,10 @@ STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.4))
 MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", 0.05))
 CONTINUATION_TTL_SECONDS = int(os.getenv("CONTINUATION_TTL_SECONDS", 300))
 
+# Настройки усреднения на 5-м колене
+AVG_LIMIT_OFFSET_PERCENT = 10.0  # Направление лимитного ордера (-10% для BUY, +10% для SELL)
+AVG_TAKE_PROFIT_PERCENT = 1.5     # Тейк-профит от новой ТВХ после усреднения
+
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip().strip("'\"")
 BINANCE_API_SECRET = os.getenv("BINANCE_SECRET_KEY", "").strip().strip("'\"")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip().strip("'\"")
@@ -95,11 +99,11 @@ def round_to_tick(price: float, tick_size: float) -> float:
     result = steps * tick
     return float(result)
 
-def calculate_tp_sl(entry_price: float, side: str, loss_streak: int, tick_size: float):
+def calculate_tp_sl(entry_price: float, side: str, loss_streak: int, tick_size: float, custom_tp_percent: float = None):
     if entry_price <= 0:
         raise ValueError("Некорректный entry_price")
     
-    target_percent = TAKE_PROFIT_PERCENT
+    target_percent = custom_tp_percent if custom_tp_percent is not None else TAKE_PROFIT_PERCENT
     tp_distance = target_percent / 100.0
     sl_distance = STOP_LOSS_PERCENT / 100.0
 
@@ -152,7 +156,10 @@ class StateManager:
             "sl_algo_id": 0,
             "sl_client_algo_id": "",
             "tp_price": 0.0,
-            "sl_price": 0.0
+            "sl_price": 0.0,
+            "avg_limit_order_id": 0,
+            "avg_limit_client_id": "",
+            "is_averaged": False
         }
         self.load()
 
@@ -421,7 +428,7 @@ class BinanceMartingaleBot:
         await self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011])
         await self._request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011, -1002, 404])
 
-    async def place_tp_sl_orders(self, side, qty, entry_price, loss_streak):
+    async def place_tp_sl_orders(self, side, qty, entry_price, loss_streak, is_averaged=False):
         if entry_price <= 0:
             logger.error("❌ TP/SL НЕ ВЫСТАВЛЕНЫ: entry_price <= 0")
             return None, None, 0.0
@@ -429,11 +436,13 @@ class BinanceMartingaleBot:
         await self.cancel_all_orders()
         opp_side = "SELL" if side == "BUY" else "BUY"
 
+        custom_tp = AVG_TAKE_PROFIT_PERCENT if is_averaged else None
         formatted_tp_price, formatted_sl_price, target_percent = calculate_tp_sl(
             entry_price=entry_price,
             side=side,
             loss_streak=loss_streak,
-            tick_size=self.tick_size
+            tick_size=self.tick_size,
+            custom_tp_percent=custom_tp
         )
         tp_numeric = float(formatted_tp_price)
         sl_numeric = float(formatted_sl_price)
@@ -444,11 +453,11 @@ class BinanceMartingaleBot:
             "sl_algo_id": 0,
             "sl_client_algo_id": "",
             "tp_price": tp_numeric,
-            "sl_price": sl_numeric if loss_streak < MAX_STREAK - 1 else 0.0
+            "sl_price": sl_numeric if (loss_streak < MAX_STREAK - 1 and not is_averaged) else 0.0
         })
 
         sl_ok = True
-        if loss_streak < MAX_STREAK - 1:
+        if loss_streak < MAX_STREAK - 1 and not is_averaged:
             sl_client_id = f"sl_{uuid.uuid4().hex[:10]}"
             sl_res = await self._request("POST", "/fapi/v1/algoOrder", {
                 "symbol": self.active_symbol,
@@ -467,7 +476,7 @@ class BinanceMartingaleBot:
                 self.strategy["sl_algo_id"] = int(sl_res.get("algoId", 0))
                 self.strategy["sl_client_algo_id"] = sl_client_id
         else:
-            logger.info(f"🛡️ {MAX_STREAK}-е колено: Стоп-Лосс ОТКЛЮЧЕН (не выставляется)")
+            logger.info(f"🛡️ {MAX_STREAK}-е колено / Усреднение: Стоп-Лосс ОТКЛЮЧЕН (не выставляется)")
 
         tp_client_id = f"tp_{uuid.uuid4().hex[:10]}"
         tp_res = await self._request("POST", "/fapi/v1/order", {
@@ -487,15 +496,106 @@ class BinanceMartingaleBot:
             self.strategy["tp_order_id"] = int(tp_res.get("orderId", 0))
             self.strategy["tp_client_id"] = tp_client_id
 
+        # Выставление лимитного ордера на усреднение для 5-го колена (если еще не усреднено)
+        if loss_streak == MAX_STREAK - 1 and not is_averaged:
+            await self.place_averaging_limit_order(side, qty, entry_price)
+
         self.state_manager.save()
 
-        if tp_ok and (sl_ok or loss_streak >= MAX_STREAK - 1):
-            sl_text = formatted_sl_price if loss_streak < MAX_STREAK - 1 else "Отсутствует"
+        if tp_ok and (sl_ok or loss_streak >= MAX_STREAK - 1 or is_averaged):
+            sl_text = formatted_sl_price if (loss_streak < MAX_STREAK - 1 and not is_averaged) else "Отсутствует"
             logger.info(f"✅ TP: {formatted_tp_price} ({target_percent}%), SL: {sl_text}")
         else:
             logger.warning(f"⚠️ TP: {'✅' if tp_ok else '❌'}, SL: {'✅' if sl_ok else '❌'}")
 
-        return formatted_tp_price, (formatted_sl_price if loss_streak < MAX_STREAK - 1 else "Отсутствует"), target_percent
+        return formatted_tp_price, (formatted_sl_price if (loss_streak < MAX_STREAK - 1 and not is_averaged) else "Отсутствует"), target_percent
+
+    async def place_averaging_limit_order(self, side, qty, entry_price):
+        """Выставляет 1 лимитный ордер на усреднение на 10% от цены входа 5-го колена"""
+        offset = AVG_LIMIT_OFFSET_PERCENT / 100.0
+        if side == "BUY":
+            raw_avg_price = entry_price * (1.0 - offset)
+        else:
+            raw_avg_price = entry_price * (1.0 + offset)
+            
+        formatted_avg_price = format_price(round_to_tick(raw_avg_price, self.tick_size), self.tick_size)
+        client_avg_id = f"avg_{uuid.uuid4().hex[:10]}"
+        
+        res = await self._request("POST", "/fapi/v1/order", {
+            "symbol": self.active_symbol,
+            "side": side,
+            "positionSide": "BOTH",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": qty,
+            "price": formatted_avg_price,
+            "newClientOrderId": client_avg_id
+        }, signed=True, weight=1)
+
+        if isinstance(res, dict) and res.get("orderId"):
+            order_id = int(res.get("orderId"))
+            self.strategy.update({
+                "avg_limit_order_id": order_id,
+                "avg_limit_client_id": client_avg_id,
+                "is_averaged": False
+            })
+            self.state_manager.save()
+            coin = self.get_coin_name()
+            logger.info(f"📌 Лимитный ордер усреднения 5-го колена выставлен: {side} {qty} {coin} по цене {formatted_avg_price} (-10%)")
+            await send_tg_async(
+                self.session,
+                f"📌 <b>ВЫСТАВЛЕН ЛИМИТ УСРЕДНЕНИЯ (5-е колено)</b>\n"
+                f"Цена ордера: <b>{formatted_avg_price}</b> (±{AVG_LIMIT_OFFSET_PERCENT}%)\n"
+                f"Объем: {qty} {coin}"
+            )
+
+    async def handle_averaging_executed(self):
+        """Вызывается при исполнении лимитного ордера усреднения"""
+        logger.info("⚡ ЛИМИТНЫЙ ОРДЕР УСРЕДНЕНИЯ ИСПОЛНЕН! Пересчитываем ТВХ и Тейк-Профит...")
+        await asyncio.sleep(0.5)
+        
+        pos = await self.get_raw_position(retries=5)
+        if not pos:
+            logger.error("❌ Не удалось получить позицию после усреднения")
+            return
+
+        new_qty = abs(float(pos.get("positionAmt", 0.0)))
+        new_entry_price = float(pos.get("entryPrice", 0.0))
+        side = self.strategy.get("side", "BUY")
+
+        if new_qty <= 0 or new_entry_price <= 0:
+            logger.error("❌ Ошибка считывания параметров новой позиции усреднения")
+            return
+
+        self.strategy.update({
+            "qty": new_qty,
+            "entry_price": new_entry_price,
+            "is_averaged": True,
+            "avg_limit_order_id": 0,
+            "avg_limit_client_id": ""
+        })
+        self.state_manager.save()
+
+        # Выставляем новый TP на 1.5% от обновленной ТВХ без стопа
+        tp_price, sl_price, target_percent = await self.place_tp_sl_orders(
+            side=side,
+            qty=new_qty,
+            entry_price=new_entry_price,
+            loss_streak=self.strategy.get("loss_streak", MAX_STREAK - 1),
+            is_averaged=True
+        )
+
+        formatted_entry = format_price(new_entry_price, self.tick_size)
+        coin = self.get_coin_name()
+
+        await send_tg_async(
+            self.session,
+            f"🎯 <b>ПОЗИЦИЯ УСРЕДНЕНА! ({self.active_symbol})</b>\n"
+            f"Новая ТВХ: <b>{formatted_entry}</b>\n"
+            f"Новый общий объем: <b>{new_qty} {coin}</b>\n"
+            f"🎯 Новый TP (1.5%): <b>{tp_price}</b>\n"
+            f"🛑 Стоп-Лосс: <b>ОТКЛЮЧЕН</b>"
+        )
 
     async def sync_existing_position(self):
         pos = await self.get_raw_position(retries=5)
@@ -516,7 +616,15 @@ class BinanceMartingaleBot:
                     current_target_usdt *= MARTINGALE_MULTIPLIER
                 
                 loss_streak = min(calculated_streak, MAX_STREAK - 1)
-                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_usdc} USDC")
+                
+                # Проверяем, усреднена ли уже позиция на 5-м колене по объему
+                is_averaged = self.strategy.get("is_averaged", False)
+                if loss_streak == MAX_STREAK - 1:
+                    base_5th_usdt = USDT_AMOUNT * (MARTINGALE_MULTIPLIER ** (MAX_STREAK - 1))
+                    if approx_usdc >= base_5th_usdt * 1.5:
+                        is_averaged = True
+
+                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_usdc} USDC (Усреднена: {is_averaged})")
                 
                 self.strategy.update({
                     "usdt": max(approx_usdc, USDT_AMOUNT),
@@ -524,18 +632,19 @@ class BinanceMartingaleBot:
                     "entry_price": entry_price,
                     "qty": qty,
                     "loss_streak": loss_streak,
+                    "is_averaged": is_averaged,
                     "state": "MONITOR",
                     "entry_time": time.time(),
                     "entry_order_id": 0
                 })
                 self.state_manager.save()
 
-                tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak)
+                tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak, is_averaged=is_averaged)
                 formatted_entry = format_price(entry_price, self.tick_size)
                 current_step = loss_streak + 1
                 coin = self.get_coin_name()
                 
-                sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
+                sl_display = f"🛑 SL: {sl_price}" if (loss_streak < MAX_STREAK - 1 and not is_averaged) else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено / Усреднено)</b>"
                 
                 await send_tg_async(
                     self.session,
@@ -598,14 +707,22 @@ class BinanceMartingaleBot:
                                 order_data = data.get("o", {})
                                 status = order_data.get("X")
                                 client_id = str(order_data.get("c", ""))
+                                order_id = int(order_data.get("i", 0) or 0)
+
                                 if status in ["FILLED", "EXECUTED"]:
                                     saved_tp_id = int(self.strategy.get("tp_order_id", 0) or 0)
-                                    order_id = int(order_data.get("i", 0) or 0)
                                     saved_tp_client = self.strategy.get("tp_client_id", "")
+                                    saved_avg_id = int(self.strategy.get("avg_limit_order_id", 0) or 0)
+                                    saved_avg_client = self.strategy.get("avg_limit_client_id", "")
+
                                     if ((saved_tp_client and client_id == saved_tp_client) or
                                             (saved_tp_id and order_id == saved_tp_id)):
                                         logger.info("🎯 WS: ТОЧНО ИСПОЛНЕН TP")
                                         asyncio.create_task(self.handle_position_closed(close_type="TP"))
+                                    elif ((saved_avg_client and client_id == saved_avg_client) or
+                                          (saved_avg_id and order_id == saved_avg_id)):
+                                        logger.info("⚡ WS: ТОЧНО ИСПОЛНЕН ЛИМИТ УСРЕДНЕНИЯ")
+                                        asyncio.create_task(self.handle_averaging_executed())
                             
                             elif event_type in ["ALGO_UPDATE", "ALGO_ORDER_UPDATE"]:
                                 algo_data = data.get("o", {})
@@ -712,11 +829,6 @@ class BinanceMartingaleBot:
         return "UNKNOWN", None
 
     async def get_last_closing_trade(self):
-        """
-        Возвращает последний фактический fill, которым была закрыта текущая позиция.
-        ВАЖНО: ищем только после фактического времени входа, чтобы не захватить
-        closing trade предыдущего колена.
-        """
         entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
         side = self.strategy.get("side", "BUY")
         closing_side = "SELL" if side == "BUY" else "BUY"
@@ -725,8 +837,6 @@ class BinanceMartingaleBot:
             return None
 
         try:
-            # Binance userTrades содержит фактические fills, включая orderId,
-            # price, qty, realizedPnl и commission.
             res = await self._request("GET", "/fapi/v1/userTrades", {
                 "symbol": self.active_symbol,
                 "startTime": entry_time_ms,
@@ -757,7 +867,6 @@ class BinanceMartingaleBot:
             return None
 
     async def _get_trades_for_order(self, order_id, retries=8):
-        """Получает ВСЕ фактические fills конкретного ордера."""
         if not order_id:
             return []
 
@@ -778,31 +887,15 @@ class BinanceMartingaleBot:
         return []
 
     async def calculate_realized_pnl(self, entry_price, exit_price, qty, side, close_trade=None):
-        """
-        ТОЛЬКО ФАКТИЧЕСКИЙ PnL. Никаких расчетов по entry/exit price как fallback.
-
-        Gross  = сумма realizedPnl только закрывающих fills.
-        Fee    = фактическая комиссия входа + фактическая комиссия выхода
-                 из userTrades.
-        Net    = Gross - Fee.
-
-        Это соответствует данным Binance userTrades: endpoint возвращает
-        realizedPnl, commission, commissionAsset, price, qty и orderId.
-        """
         entry_order_id = int(self.strategy.get("entry_order_id", 0) or 0)
-
-        # 1) Точные fills входного MARKET-ордера.
         entry_trades = await self._get_trades_for_order(entry_order_id) if entry_order_id else []
 
-        # Если позиция была подхвачена после перезапуска, entry_order_id неизвестен.
-        # В этом случае НЕ придумываем PnL и не подставляем математическую оценку.
         if not entry_trades:
             logger.warning(
                 f"⚠️ Точные fills входа не найдены (entry_order_id={entry_order_id}). "
                 "Комиссия входа не будет выдумываться."
             )
 
-        # 2) Определяем реальный closing orderId.
         if close_trade is None:
             close_trade = await self.get_last_closing_trade()
 
@@ -816,7 +909,6 @@ class BinanceMartingaleBot:
             )
             return None
 
-        # Защита: в закрывающем ордере должны быть fills противоположной стороны.
         closing_side = "SELL" if side == "BUY" else "BUY"
         close_trades = [
             t for t in close_trades
@@ -826,17 +918,10 @@ class BinanceMartingaleBot:
             logger.warning("⚠️ В closing order нет fills нужной стороны.")
             return None
 
-        # Gross PnL — Binance realizedPnl по каждому фактическому закрывающему fill.
         gross = sum(float(t.get("realizedPnl", 0) or 0) for t in close_trades)
-
-        # Комиссии — только реальные значения commission из userTrades.
-        # Не используем фиксированный процент комиссии.
         entry_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in entry_trades)
         close_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in close_trades)
 
-        # Для USDC-M фьючерсов комиссия должна быть в margin asset (USDC).
-        # Если Binance вернул другой commissionAsset, не превращаем его
-        # искусственно в USDC — явно помечаем это в логах.
         fee_assets = sorted({
             str(t.get("commissionAsset", ""))
             for t in (entry_trades + close_trades)
@@ -852,7 +937,6 @@ class BinanceMartingaleBot:
         total_fee = entry_fee + close_fee
         net = gross - total_fee
 
-        # Фактический средний exit price и объем по fills.
         exit_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in close_trades)
         exit_notional = sum(
             abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
@@ -861,7 +945,6 @@ class BinanceMartingaleBot:
         )
         actual_exit_price = exit_notional / exit_qty if exit_qty > 0 else 0.0
 
-        # Фактический входной notional — из fills, а не из заданного USDT_AMOUNT.
         entry_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in entry_trades)
         entry_notional = sum(
             abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
@@ -870,8 +953,6 @@ class BinanceMartingaleBot:
         )
 
         if entry_notional <= 0:
-            # Для подхваченной позиции можем показать процент только если есть
-            # сохраненный реальный entryPrice, но сам USDC PnL остается строго API-based.
             entry_notional = abs(entry_price * (exit_qty if exit_qty > 0 else qty))
 
         percent = (net / entry_notional) * 100 if entry_notional > 0 else 0.0
@@ -968,6 +1049,9 @@ class BinanceMartingaleBot:
                     "tp_client_id": "",
                     "sl_algo_id": 0,
                     "sl_client_algo_id": "",
+                    "avg_limit_order_id": 0,
+                    "avg_limit_client_id": "",
+                    "is_averaged": False,
                     "tp_price": 0.0,
                     "sl_price": 0.0,
                     "last_tp_time": time.time(),
@@ -1004,6 +1088,9 @@ class BinanceMartingaleBot:
                         "qty": 0.0,
                         "entry_price": 0.0,
                         "entry_order_id": 0,
+                        "avg_limit_order_id": 0,
+                        "avg_limit_client_id": "",
+                        "is_averaged": False,
                         "last_tp_time": 0.0
                     })
                     self.state_manager.save()
@@ -1039,6 +1126,9 @@ class BinanceMartingaleBot:
                     "qty": 0.0,
                     "entry_price": 0.0,
                     "entry_order_id": 0,
+                    "avg_limit_order_id": 0,
+                    "avg_limit_client_id": "",
+                    "is_averaged": False,
                     "last_tp_time": 0.0
                 })
                 self.state_manager.save()
@@ -1084,7 +1174,8 @@ class BinanceMartingaleBot:
                 "qty": new_qty,
                 "entry_price": entry_price,
                 "entry_time": time.time(),
-                "entry_order_id": int(order_id)
+                "entry_order_id": int(order_id),
+                "is_averaged": False
             })
             self.state_manager.save()
 
@@ -1137,6 +1228,9 @@ class BinanceMartingaleBot:
                     "qty": 0.0,
                     "entry_price": 0.0,
                     "entry_order_id": 0,
+                    "avg_limit_order_id": 0,
+                    "avg_limit_client_id": "",
+                    "is_averaged": False,
                     "last_tp_time": 0.0
                 })
                 self.state_manager.save()
@@ -1236,7 +1330,8 @@ class BinanceMartingaleBot:
                             "entry_price": entry_price,
                             "qty": qty,
                             "entry_time": time.time(),
-                            "entry_order_id": int(order_id)
+                            "entry_order_id": int(order_id),
+                            "is_averaged": False
                         })
                         self.state_manager.save()
 
@@ -1274,11 +1369,22 @@ class BinanceMartingaleBot:
                                 if not self.is_processing_close:
                                     asyncio.create_task(self.handle_position_closed())
                             else:
-                                self.strategy.update({
-                                    "entry_price": float(pos.get("entryPrice", self.strategy.get("entry_price", 0.0))),
-                                    "qty": abs(float(pos.get("positionAmt", 0.0)))
-                                })
-                                self.state_manager.save()
+                                current_entry_price = float(pos.get("entryPrice", self.strategy.get("entry_price", 0.0)))
+                                saved_entry_price = float(self.strategy.get("entry_price", 0.0))
+                                saved_qty = float(self.strategy.get("qty", 0.0))
+                                is_averaged = self.strategy.get("is_averaged", False)
+
+                                # Детект исполнения лимитного ордера / ручного сдвига лимитника на графике
+                                if not is_averaged and self.strategy.get("loss_streak", 0) == MAX_STREAK - 1:
+                                    if pos_amt > saved_qty * 1.1 or (saved_entry_price > 0 and abs(current_entry_price - saved_entry_price) / saved_entry_price > 0.01):
+                                        logger.info("🔍 Обнаружено изменение объема/ТВХ на 5-м колене (исполнен/передвинут лимитник)")
+                                        asyncio.create_task(self.handle_averaging_executed())
+                                else:
+                                    self.strategy.update({
+                                        "entry_price": current_entry_price,
+                                        "qty": pos_amt
+                                    })
+                                    self.state_manager.save()
 
             except Exception as e:
                 logger.error(f"Ошибка в цикле strategy_loop: {e}")
