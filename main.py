@@ -41,7 +41,7 @@ CONTINUATION_TTL_SECONDS = int(os.getenv("CONTINUATION_TTL_SECONDS", 300))
 
 # Настройки усреднения на 5-м колене
 AVG_LIMIT_OFFSET_PERCENT = 10.0  # Направление лимитного ордера (-10% для BUY, +10% для SELL)
-AVG_TAKE_PROFIT_PERCENT = 1.5     # Тейк-профит от новой ТВХ после усреднения
+AVG_TAKE_PROFIT_PERCENT = 1.0     # Тейк-профит от новой ТВХ после усреднения
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip().strip("'\"")
 BINANCE_API_SECRET = os.getenv("BINANCE_SECRET_KEY", "").strip().strip("'\"")
