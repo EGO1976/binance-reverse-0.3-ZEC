@@ -30,10 +30,10 @@ MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.35))
 MAX_STREAK = int(os.getenv("MAX_STREAK", 5))
 
 # Фиксированный Тейк-Профит в процентах
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.4))
+TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.45))
 
 # Фиксированный Стоп-Лосс в процентах
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.4))
+STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.45))
 
 # Фильтрация по ATR и TTL продолжения тренда (установлено 5 минут = 300 секунд)
 MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", 0.05))
