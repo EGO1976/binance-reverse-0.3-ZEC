@@ -497,12 +497,9 @@ class CCXTUsdcHedgeBot:
 
                 # --- 1. Проверка срабатывания ТЕЙК-ПРОФИТА LONG (если контракты резко уменьшились) ---
                 if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
-                    # Проверяем, действительно ли это закрытие по тейку (позиция закрылась либо уменьшилась до базы/нуля)
-                    # Если контракты стали меньше предыдущего значения больше чем на 10% (или обнулились)
                     drop_diff = self.long_contracts_prev - long_contracts
                     if drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0:
-                        logger.info(📉 Обнаружено закрытие/исполнение тейка по LONG!)
-                        # Отменяем старые ордера этой ветки
+                        logger.info("Обнаружено закрытие/исполнение тейка по LONG!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -518,7 +515,7 @@ class CCXTUsdcHedgeBot:
                 if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
                     drop_diff = self.short_contracts_prev - short_contracts
                     if drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0:
-                        logger.info(📉 Обнаружено закрытие/исполнение тейка по SHORT!)
+                        logger.info("Обнаружено закрытие/исполнение тейка по SHORT!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
@@ -558,11 +555,9 @@ class CCXTUsdcHedgeBot:
                         await self.audit_and_sync_all_orders()
                         continue
 
-                # Обновляем предыдущие значения для следующего тика
                 self.long_contracts_prev = long_contracts
                 self.short_contracts_prev = short_contracts
 
-                # Регулярная сверка стакана (уважает ручной перенос ордеров)
                 await self.audit_and_sync_all_orders()
 
             except Exception as e:
