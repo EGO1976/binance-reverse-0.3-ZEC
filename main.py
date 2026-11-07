@@ -1,1449 +1,617 @@
 import asyncio
-import hashlib
-import hmac
-import logging
-import math
 import os
 import time
-import urllib.parse
-import uuid
-import json
-from decimal import Decimal, ROUND_HALF_UP
+import math
 import aiohttp
-import ujson
+import ccxt.async_support as ccxt
 import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-try:
-    import websockets
-except ImportError:
-    websockets = None
+# ==============================================================================
+# 🎛️ ПАНЕЛЬ УПРАВЛЕНИЯ ПАРАМЕТРАМИ БОТА (HEDGE MODE / USDC)
+# ==============================================================================
 
-# =========================================================================
-# ⚙️ ОСНОВНЫЕ НАСТРОЙКИ БОТА
-# =========================================================================
-SYMBOL = os.getenv("SYMBOL", "ZECUSDC").strip()
-LEVERAGE = int(os.getenv("LEVERAGE", 50))
-USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", 50))
-MARTINGALE_MULTIPLIER = float(os.getenv("MARTINGALE", 2.35))
-MAX_STREAK = int(os.getenv("MAX_STREAK", 5))
+SYMBOL_RAW = os.getenv('SYMBOL', 'ZEC/USDC:USDC').strip()
+SYMBOL = SYMBOL_RAW
+# Чистое имя для красивых сообщений в телеграм (например, BTC/USDC)
+SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 
-# Фиксированный Тейк-Профит в процентах
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.5))
+LEVERAGE = int(os.getenv('LEVERAGE', 50))
+BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))  # Стартовый объем в USDC для каждой ветки
 
-# Фиксированный Стоп-Лосс в процентах
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.5))
+GRID_LEVELS = 3                 # 3 уровня усреднения
+VISIBLE_GRID_LEVELS = 1         # По одной лимитке усреднения в стакане
 
-# Фильтрация по ATR и TTL продолжения тренда (установлено 5 минут = 300 секунд)
-MIN_ATR_PERCENT = float(os.getenv("MIN_ATR_PERCENT", 0.05))
-CONTINUATION_TTL_SECONDS = int(os.getenv("CONTINUATION_TTL_SECONDS", 300))
+# Точные отступы сетки: -5%, -10%, -15% от ТВХ
+def get_grid_step_percent(step: int) -> float:
+    if step == 1:
+        return 5.0
+    elif step == 2:
+        return 10.0
+    elif step == 3:
+        return 15.0
+    return 15.0
 
-# Настройки усреднения на 5-м колене
-AVG_LIMIT_OFFSET_PERCENT = 10.0  # Направление лимитного ордера (-10% для BUY, +10% для SELL)
-AVG_TAKE_PROFIT_PERCENT = 1.0     # Тейк-профит от новой ТВХ после усреднения
+# Объемы по уровням с мультипликаторами x1, x2, x4
+def get_step_usdc_volume(step: int) -> float:
+    if step <= 1:
+        return float(BASE_ORDER_USDC)
+    elif step == 2:
+        return float(BASE_ORDER_USDC * 2.0)
+    elif step == 3:
+        return float(BASE_ORDER_USDC * 4.0)
+    return float(BASE_ORDER_USDC * 4.0)
 
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip().strip("'\"")
-BINANCE_API_SECRET = os.getenv("BINANCE_SECRET_KEY", "").strip().strip("'\"")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip().strip("'\"")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip("'\"")
-STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
-# =========================================================================
+WINNER_TAKE_PROFIT_PCT = 0.5    # Жестко 0.5% TP для всех уровней
 
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+
+import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-logger = logging.getLogger("MARTINGALE_BOT")
+logger = logging.getLogger("CCXT_USDC_HEDGE_BOT")
 
-LAST_ERROR_STATE = {"key": None, "sent": False}
+async def send_tg_message(session: aiohttp.ClientSession, text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or session is None or session.closed:
+        print(f"💬 [TG Log]: {text}")
+        return
 
-async def send_tg_async(session: aiohttp.ClientSession, text: str, is_error: bool = False, error_key: str = None):
-    global LAST_ERROR_STATE
-    
-    if is_error and error_key:
-        if LAST_ERROR_STATE["key"] == error_key and LAST_ERROR_STATE["sent"]:
-            return
-        LAST_ERROR_STATE["key"] = error_key
-        LAST_ERROR_STATE["sent"] = True
-    elif not is_error:
-        LAST_ERROR_STATE["key"] = None
-        LAST_ERROR_STATE["sent"] = False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': text,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True
+    }
+    try:
+        async with session.post(url, json=payload, timeout=5) as resp:
+            pass
+    except Exception as e:
+        print(f"❌ Ошибка Telegram: {e}")
 
-    if TG_TOKEN and TG_CHAT_ID and session and not session.closed:
-        try:
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-            payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-            async with session.post(url, json=payload, timeout=3) as resp:
-                await resp.read()
-        except Exception as e:
-            logger.error(f"Ошибка отправки Telegram: {e}")
-
-def format_price(price, tick_size=0.1):
-    if tick_size <= 0:
-        tick_size = 0.1
-    precision = max(0, int(round(-math.log10(tick_size))))
-    if precision == 0:
-        return str(int(round(price)))
-    return f"{price:.{precision}f}"
-
-def format_qty(qty, step_size=0.001):
-    if step_size <= 0:
-        step_size = 0.001
-    precision = max(0, int(round(-math.log10(step_size))))
-    return round(float(qty), precision)
-
-def round_to_tick(price: float, tick_size: float) -> float:
-    if tick_size <= 0:
-        return float(price)
-    p = Decimal(str(price))
-    tick = Decimal(str(tick_size))
-    steps = (p / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    result = steps * tick
-    return float(result)
-
-def calculate_tp_sl(entry_price: float, side: str, loss_streak: int, tick_size: float, custom_tp_percent: float = None):
-    if entry_price <= 0:
-        raise ValueError("Некорректный entry_price")
-    
-    target_percent = custom_tp_percent if custom_tp_percent is not None else TAKE_PROFIT_PERCENT
-    tp_distance = target_percent / 100.0
-    sl_distance = STOP_LOSS_PERCENT / 100.0
-
-    if side == "BUY":
-        raw_tp = entry_price * (1.0 + tp_distance)
-        raw_sl = entry_price * (1.0 - sl_distance)
-    else:
-        raw_tp = entry_price * (1.0 - tp_distance)
-        raw_sl = entry_price * (1.0 + sl_distance)
-
-    tp = round_to_tick(raw_tp, tick_size)
-    sl = round_to_tick(raw_sl, tick_size)
-    return format_price(tp, tick_size), format_price(sl, tick_size), target_percent
-
-class BinanceRateLimiter:
-    def __init__(self, max_per_minute=1200):
-        self.max_per_minute = max_per_minute
-        self.tokens = max_per_minute
-        self.last_update = time.time()
-        self.lock = asyncio.Lock()
-
-    async def wait(self, weight=1):
-        async with self.lock:
-            now = time.time()
-            elapsed = now - self.last_update
-            self.last_update = now
-            self.tokens = min(self.max_per_minute, self.tokens + elapsed * (self.max_per_minute / 60.0))
-            if self.tokens < weight:
-                sleep_time = (weight - self.tokens) * (60.0 / self.max_per_minute)
-                await asyncio.sleep(sleep_time)
-                self.tokens = 0
-            else:
-                self.tokens -= weight
-
-class StateManager:
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.state = {
-            "usdt": USDT_AMOUNT,
-            "side": "BUY",
-            "loss_streak": 0,
-            "qty": 0.0,
-            "entry_price": 0.0,
-            "state": "ENTRY",
-            "entry_time": 0.0,
-            "last_tp_time": 0.0,
-            "entry_order_id": 0,
-            "tp_order_id": 0,
-            "tp_client_id": "",
-            "sl_algo_id": 0,
-            "sl_client_algo_id": "",
-            "tp_price": 0.0,
-            "sl_price": 0.0,
-            "avg_limit_order_id": 0,
-            "avg_limit_client_id": "",
-            "avg_limit_price": 0.0,
-            "is_averaged": False
-        }
-        self.load()
-
-    def load(self):
-        try:
-            with open(self.file_path, 'r') as f:
-                saved = json.load(f)
-                self.state.update(saved)
-                logger.info(f"Состояние загружено из {self.file_path}")
-        except FileNotFoundError:
-            logger.info("Файл состояния не найден, используем начальные значения")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки состояния: {e}")
-
-    def save(self):
-        try:
-            with open(self.file_path, 'w') as f:
-                json.dump(self.state, f, indent=2)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения состояния: {e}")
-
-    def get(self, key, default=None):
-        return self.state.get(key, default)
-
-    def set(self, key, value):
-        self.state[key] = value
-        self.save()
-
-    def update(self, data):
-        self.state.update(data)
-        self.save()
-
-class BinanceMartingaleBot:
+class CCXTUsdcHedgeBot:
     def __init__(self):
-        self.base_url = "https://fapi.binance.com"
-        self.ws_base_url = "wss://fstream.binance.com/ws"
-        self.session = None
-        self.rate_limiter = BinanceRateLimiter()
-        
-        self.active_symbol = SYMBOL
-        self.latest_price = 0.0
-        self.last_price_time = 0.0
+        self.exchange = None
+        self.market_info = None
+        self.http_session = None
         self.is_running = True
-        self.step_size = 0.001
-        self.tick_size = 0.1
-        self.listen_key = None
-        self.last_pos_check_time = 0.0
-        self.is_processing_close = False
-        
-        self.state_manager = StateManager(STATE_FILE)
-        self.strategy = self.state_manager.state
-        self.startup_sync_complete = False
-        self.adopted_existing_position = False
 
-    def get_coin_name(self) -> str:
-        return self.active_symbol.replace("USDC", "").replace("USDT", "")
+        self.long_entry_price = 0.0
+        self.short_entry_price = 0.0
 
-    async def _request(self, method, endpoint, params=None, signed=False, weight=1, suppress_error_codes=None):
-        if suppress_error_codes is None:
-            suppress_error_codes = []
+        self.initial_long_entry = 0.0
+        self.initial_short_entry = 0.0
 
-        await self.rate_limiter.wait(weight=weight)
-        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-        
-        if params is None:
-            params = {}
-        else:
-            params = params.copy()
+        self.long_contracts_prev = 0.0
+        self.short_contracts_prev = 0.0
 
-        params.pop("timestamp", None)
-        params.pop("signature", None)
+        self.long_loser_step = 0
+        self.short_loser_step = 0
 
-        query_list = [f"{k}={ 'true' if v is True else ('false' if v is False else str(v)) }" for k, v in sorted(params.items(), key=lambda x: x[0])]
+        self.active_limit_orders = {}
+        self.long_tp_order_id = None
+        self.short_tp_order_id = None
 
-        if signed:
-            timestamp = int(time.time() * 1000)
-            query_list.append(f"timestamp={timestamp}")
+        self.exec_lock = asyncio.Lock()
 
-        query_string = "&".join(query_list)
+    def init_exchange(self):
+        raw_key = os.getenv('BINANCE_API_KEY', '').strip().strip("'").strip('"')
+        raw_secret = os.getenv('BINANCE_SECRET_KEY', '').strip().strip('"').strip("'")
 
-        if signed:
-            signature = hmac.new(
-                BINANCE_API_SECRET.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            query_string += f"&signature={signature}"
+        return ccxt.binanceusdm({
+            'apiKey': raw_key,
+            'secret': raw_secret,
+            'enableRateLimit': True,
+            'rateLimit': 300,
+            'timeout': 10000,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True
+            }
+        })
 
-        url = f"{self.base_url}{endpoint}"
+    async def safe_close_exchange(self):
+        if self.exchange:
+            try:
+                await self.exchange.close()
+            except Exception:
+                pass
+            self.exchange = None
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+
+    async def initialize(self):
+        if self.exchange is None:
+            self.exchange = self.init_exchange()
+        if self.http_session is None or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession()
+
+        if self.market_info is None:
+            markets = await self.exchange.load_markets()
+            if SYMBOL in markets:
+                self.market_info = markets[SYMBOL]
+            else:
+                raise KeyError(f"Символ {SYMBOL} не найден на бирже.")
 
         try:
-            method_upper = method.upper()
-            if method_upper in ["POST", "PUT", "DELETE"]:
-                headers["Content-Type"] = "application/x-www-form-urlencoded"
-                async with self.session.request(method_upper, url, data=query_string, headers=headers, timeout=3) as response:
-                    if response.status == 404:
-                        logger.warning(f"Binance API 404 Not Found [{endpoint}]")
-                        return {"code": 404, "msg": "Endpoint Not Found"}
-                    try:
-                        res = await response.json()
-                    except Exception:
-                        text_body = await response.text()
-                        logger.warning(f"Non-JSON response [{endpoint}]: {text_body[:100]}")
-                        return {"code": response.status, "msg": text_body[:100]}
-            else:
-                full_url = f"{url}?{query_string}" if query_string else url
-                async with self.session.request(method_upper, full_url, headers=headers, timeout=3) as response:
-                    if response.status == 404:
-                        logger.warning(f"Binance API 404 Not Found [{endpoint}]")
-                        return {"code": 404, "msg": "Endpoint Not Found"}
-                    try:
-                        res = await response.json()
-                    except Exception:
-                        text_body = await response.text()
-                        logger.warning(f"Non-JSON response [{endpoint}]: {text_body[:100]}")
-                        return {"code": response.status, "msg": text_body[:100]}
-
-            if isinstance(res, dict) and "code" in res and res["code"] != 200:
-                code = res.get("code")
-                msg = res.get("msg", "")
-                if code not in suppress_error_codes and code != 404:
-                    logger.error(f"Binance API Error [{endpoint}]: Code {code}, Msg: {msg}")
-                    if code == -1003:
-                        await send_tg_async(self.session, f"⚠️ <b>ПРЕВЫШЕН ЛИМИТ ЗАПРОСОВ</b>\n{msg}", is_error=True, error_key="rate_limit")
-                    elif code in [-2008, -2014, -2015, -1022]:
-                        await send_tg_async(self.session, f"⚠️ <b>ОШИБКА BINANCE API KEY</b>\n{msg} (Код {code})", is_error=True, error_key=f"api_{code}")
-            return res
-        except Exception as e:
-            logger.error(f"Ошибка REST API [{endpoint}]: {e}")
-            await send_tg_async(self.session, f"⚠️ <b>СБОЙ СЕТЕВОГО СОЕДИНЕНИЯ</b>\n{e}", is_error=True, error_key="network_error")
-            return {"code": -1, "msg": str(e)}
-
-    async def fetch_symbol_info(self):
-        res = await self._request("GET", "/fapi/v1/exchangeInfo")
-        if isinstance(res, dict) and "symbols" in res:
-            for s in res["symbols"]:
-                if s.get("symbol") == self.active_symbol:
-                    for f in s.get("filters", []):
-                        if f.get("filterType") == "LOT_SIZE":
-                            self.step_size = float(f.get("stepSize", 0.001))
-                        elif f.get("filterType") == "PRICE_FILTER":
-                            self.tick_size = float(f.get("tickSize", 0.1))
-                    logger.info(f"Параметры {self.active_symbol}: stepSize={self.step_size}, tickSize={self.tick_size}")
-                    break
-
-    async def get_market_data(self):
-        if self.latest_price > 0 and (time.time() - self.last_price_time) < 2.0:
-            return self.latest_price
-        res = await self._request("GET", "/fapi/v1/ticker/price", {"symbol": self.active_symbol})
-        if isinstance(res, dict) and "price" in res:
-            self.latest_price = float(res["price"])
-            self.last_price_time = time.time()
-            return self.latest_price
-        return 0.0
-
-    async def get_raw_position(self, retries=2):
-        for attempt in range(retries):
-            res = await self._request("GET", "/fapi/v2/positionRisk", {"symbol": self.active_symbol}, signed=True, weight=5)
-            if isinstance(res, list):
-                for pos in res:
-                    if pos.get("symbol") == self.active_symbol:
-                        return pos
-            await asyncio.sleep(0.3)
-        return None
-
-    async def get_actual_entry_price(self, order_id, side, retries=10):
-        expected_sign = 1 if side == "BUY" else -1
-        for _ in range(retries):
+            await self.exchange.set_leverage(LEVERAGE, SYMBOL)
             try:
-                order = await self._request("GET", "/fapi/v1/order", {
-                    "symbol": self.active_symbol,
-                    "orderId": order_id
-                }, signed=True, weight=1)
-                if isinstance(order, dict):
-                    avg_price = float(order.get("avgPrice", 0) or 0)
-                    if order.get("status") == "FILLED" and avg_price > 0:
-                        logger.info(f"🎯 Фактический avgPrice MARKET: {avg_price}")
-                        return avg_price
-            except Exception as e:
-                logger.warning(f"Ошибка получения MARKET order: {e}")
+                await self.exchange.set_margin_mode('CROSSED', SYMBOL)
+            except Exception:
+                pass
+            await self.exchange.set_position_mode(hedged=True, symbol=SYMBOL)
+        except Exception:
+            pass
 
+        logger.info(f"✅ Инициализация выполнена для {SYMBOL_DISPLAY}. Плечо {LEVERAGE}x CROSSED (Hedge Mode, USDC).")
+
+    def round_amount(self, amount):
+        try:
+            precision = self.market_info.get('precision', {}).get('amount')
+            if precision is not None:
+                if isinstance(precision, int):
+                    return round(amount, precision)
+                elif isinstance(precision, float) and precision > 0:
+                    precision_digits = abs(int(math.log10(precision)))
+                    return round(amount, precision_digits)
+            return float(self.exchange.amount_to_precision(SYMBOL, amount))
+        except Exception:
+            return round(amount, 3)
+
+    def round_price(self, price):
+        try:
+            return float(self.exchange.price_to_precision(SYMBOL, price))
+        except Exception:
+            return round(price, 2)
+
+    def calculate_qty_for_usdc(self, usdc_volume, price):
+        if price <= 0:
+            return 0.0
+
+        raw_qty = usdc_volume / price
+        precision = self.market_info.get('precision', {}).get('amount')
+        digits = 3
+        if isinstance(precision, int):
+            digits = precision
+        elif isinstance(precision, float) and precision > 0:
+            digits = abs(int(math.log10(precision)))
+
+        qty = round(raw_qty, digits)
+        limits = self.market_info.get('limits', {})
+        min_qty = limits.get('amount', {}).get('min', 0.001)
+        if qty < min_qty:
+            qty = round(min_qty, digits)
+
+        return qty
+
+    async def get_actual_position_entry_price(self, position_side):
+        for _ in range(5):
             try:
-                pos = await self.get_raw_position(retries=1)
+                positions = await self.exchange.fetch_positions([SYMBOL])
+                pos = next((p for p in positions if p['side'] == position_side.lower() and float(p['contracts']) > 0), None)
                 if pos:
-                    position_amt = float(pos.get("positionAmt", 0))
-                    entry_price = float(pos.get("entryPrice", 0))
-                    correct_direction = (expected_sign > 0 and position_amt > 0) or (expected_sign < 0 and position_amt < 0)
-                    if correct_direction and abs(position_amt) > 0 and entry_price > 0:
-                        logger.info(f"🎯 Фактический entryPrice из positionRisk: {entry_price}")
-                        return entry_price
+                    return float(pos['entryPrice']), float(pos['contracts'])
             except Exception as e:
-                logger.warning(f"Ошибка получения positionRisk: {e}")
+                logger.error(f"Ошибка получения позиции {position_side}: {e}")
+            await asyncio.sleep(0.5)
+        return 0.0, 0.0
 
-            await asyncio.sleep(0.2)
-        return 0.0
-
-    async def get_free_margin(self) -> float:
-        res = await self._request("GET", "/fapi/v2/account", signed=True, weight=5)
-        if isinstance(res, dict):
-            assets = res.get("assets", [])
-            target_asset = "USDC" if "USDC" in self.active_symbol else "USDT"
-            for asset in assets:
-                if asset.get("asset") == target_asset:
-                    val = float(asset.get("availableBalance", asset.get("maxWithdrawAmount", 0.0)))
-                    if val > 0:
-                        return val
-            root_avail = float(res.get("availableBalance", 0.0))
-            if root_avail > 0:
-                return root_avail
-            root_max_withdraw = float(res.get("maxWithdrawAmount", 0.0))
-            if root_max_withdraw > 0:
-                return root_max_withdraw
-        bal_res = await self._request("GET", "/fapi/v2/balance", signed=True, weight=1)
-        if isinstance(bal_res, list):
-            target_asset = "USDC" if "USDC" in self.active_symbol else "USDT"
-            for b in bal_res:
-                if b.get("asset") == target_asset:
-                    return float(b.get("availableBalance", b.get("maxWithdrawAmount", 0.0)))
-        return 0.0
-
-    async def get_atr_and_candle_color(self):
-        res = await self._request("GET", "/fapi/v1/klines", {
-            "symbol": self.active_symbol,
-            "interval": "5m",
-            "limit": 15
-        }, weight=1)
-        
-        if not isinstance(res, list) or len(res) < 15:
-            logger.warning("Не удалось получить достаточное количество 5m свечей для ATR")
-            return 0.0, "BUY"
-
-        tr_list = []
-        for i in range(1, len(res)):
-            high = float(res[i][2])
-            low = float(res[i][3])
-            prev_close = float(res[i-1][4])
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            tr_list.append(tr)
-
-        atr = sum(tr_list[-14:]) / 14.0
-        current_price = float(res[-1][4])
-        atr_percent = (atr / current_price) * 100.0 if current_price > 0 else 0.0
-
-        last_open = float(res[-1][1])
-        last_close = float(res[-1][4])
-        candle_color = "BUY" if last_close >= last_open else "SELL"
-
-        logger.info(f"📊 ATR(14) 5m = {atr_percent:.3f}% (Мин: {MIN_ATR_PERCENT}%), Цвет 5m свечи = {candle_color}")
-        return atr_percent, candle_color
-
-    async def get_listen_key(self):
-        res = await self._request("POST", "/fapi/v1/listenKey", signed=True, weight=1)
-        if isinstance(res, dict) and "listenKey" in res:
-            self.listen_key = res["listenKey"]
-            return self.listen_key
-        return None
-
-    async def keepalive_listen_key(self):
-        while self.is_running:
-            await asyncio.sleep(1500)
-            if self.listen_key:
-                await self._request("PUT", "/fapi/v1/listenKey", signed=True, weight=1)
-                logger.info("🔑 ListenKey обновлен")
-
-    async def cancel_all_orders(self):
-        await self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011])
-        await self._request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": self.active_symbol}, signed=True, weight=1, suppress_error_codes=[-2011, -1002, 404])
-
-    async def place_tp_sl_orders(self, side, qty, entry_price, loss_streak, is_averaged=False):
-        if entry_price <= 0:
-            logger.error("❌ TP/SL НЕ ВЫСТАВЛЕНЫ: entry_price <= 0")
-            return None, None, 0.0
-
-        await self.cancel_all_orders()
-        opp_side = "SELL" if side == "BUY" else "BUY"
-
-        custom_tp = AVG_TAKE_PROFIT_PERCENT if is_averaged else None
-        formatted_tp_price, formatted_sl_price, target_percent = calculate_tp_sl(
-            entry_price=entry_price,
-            side=side,
-            loss_streak=loss_streak,
-            tick_size=self.tick_size,
-            custom_tp_percent=custom_tp
-        )
-        tp_numeric = float(formatted_tp_price)
-        sl_numeric = float(formatted_sl_price)
-
-        self.strategy.update({
-            "tp_order_id": 0,
-            "tp_client_id": "",
-            "sl_algo_id": 0,
-            "sl_client_algo_id": "",
-            "tp_price": tp_numeric,
-            "sl_price": sl_numeric if (loss_streak < MAX_STREAK - 1 and not is_averaged) else 0.0
-        })
-
-        sl_ok = True
-        if loss_streak < MAX_STREAK - 1 and not is_averaged:
-            sl_client_id = f"sl_{uuid.uuid4().hex[:10]}"
-            sl_res = await self._request("POST", "/fapi/v1/algoOrder", {
-                "symbol": self.active_symbol,
-                "side": opp_side,
-                "positionSide": "BOTH",
-                "algoType": "CONDITIONAL",
-                "type": "STOP_MARKET",
-                "triggerPrice": formatted_sl_price,
-                "closePosition": True,
-                "workingType": "CONTRACT_PRICE",
-                "clientAlgoId": sl_client_id
-            }, signed=True, weight=1)
-            
-            sl_ok = isinstance(sl_res, dict) and sl_res.get("algoId") is not None
-            if sl_ok:
-                self.strategy["sl_algo_id"] = int(sl_res.get("algoId", 0))
-                self.strategy["sl_client_algo_id"] = sl_client_id
-        else:
-            logger.info(f"🛡️ {MAX_STREAK}-е колено / Усреднение: Стоп-Лосс ОТКЛЮЧЕН (не выставляется)")
-
-        tp_client_id = f"tp_{uuid.uuid4().hex[:10]}"
-        tp_res = await self._request("POST", "/fapi/v1/order", {
-            "symbol": self.active_symbol,
-            "side": opp_side,
-            "positionSide": "BOTH",
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": qty,
-            "price": formatted_tp_price,
-            "reduceOnly": True,
-            "newClientOrderId": tp_client_id
-        }, signed=True, weight=1)
-        
-        tp_ok = isinstance(tp_res, dict) and tp_res.get("orderId") is not None
-        if tp_ok:
-            self.strategy["tp_order_id"] = int(tp_res.get("orderId", 0))
-            self.strategy["tp_client_id"] = tp_client_id
-
-        # Выставление лимитного ордера усреднения для 5-го колена
-        if loss_streak == MAX_STREAK - 1 and not is_averaged:
-            await self.place_averaging_limit_order(side, qty, entry_price)
-
-        self.state_manager.save()
-
-        if tp_ok and (sl_ok or loss_streak >= MAX_STREAK - 1 or is_averaged):
-            sl_text = formatted_sl_price if (loss_streak < MAX_STREAK - 1 and not is_averaged) else "Отсутствует"
-            logger.info(f"✅ TP: {formatted_tp_price} ({target_percent}%), SL: {sl_text}")
-        else:
-            logger.warning(f"⚠️ TP: {'✅' if tp_ok else '❌'}, SL: {'✅' if sl_ok else '❌'}")
-
-        return formatted_tp_price, (formatted_sl_price if (loss_streak < MAX_STREAK - 1 and not is_averaged) else "Отсутствует"), target_percent
-
-    async def place_averaging_limit_order(self, side, qty, entry_price):
-        """Выставляет 1 лимитный ордер на усреднение на 10% от цены входа 5-го колена"""
-        offset = AVG_LIMIT_OFFSET_PERCENT / 100.0
-        if side == "BUY":
-            raw_avg_price = entry_price * (1.0 - offset)
-        else:
-            raw_avg_price = entry_price * (1.0 + offset)
-            
-        formatted_avg_price = format_price(round_to_tick(raw_avg_price, self.tick_size), self.tick_size)
-        client_avg_id = f"avg_{uuid.uuid4().hex[:10]}"
-        
-        res = await self._request("POST", "/fapi/v1/order", {
-            "symbol": self.active_symbol,
-            "side": side,
-            "positionSide": "BOTH",
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": qty,
-            "price": formatted_avg_price,
-            "newClientOrderId": client_avg_id
-        }, signed=True, weight=1)
-
-        if isinstance(res, dict) and res.get("orderId"):
-            order_id = int(res.get("orderId"))
-            self.strategy.update({
-                "avg_limit_order_id": order_id,
-                "avg_limit_client_id": client_avg_id,
-                "avg_limit_price": float(formatted_avg_price),
-                "is_averaged": False
-            })
-            self.state_manager.save()
-            coin = self.get_coin_name()
-            logger.info(f"📌 Лимитный ордер усреднения 5-го колена выставлен: {side} {qty} {coin} по цене {formatted_avg_price} (-10%)")
-
-    async def handle_averaging_executed(self):
-        """Вызывается при исполнении лимитного ордера усреднения"""
-        logger.info("⚡ ЛИМИТНЫЙ ОРДЕР УСРЕДНЕНИЯ ИСПОЛНЕН! Пересчитываем ТВХ и Тейк-Профит...")
-        await asyncio.sleep(0.5)
-        
-        pos = await self.get_raw_position(retries=5)
-        if not pos:
-            logger.error("❌ Не удалось получить позицию после усреднения")
-            return
-
-        new_qty = abs(float(pos.get("positionAmt", 0.0)))
-        new_entry_price = float(pos.get("entryPrice", 0.0))
-        side = self.strategy.get("side", "BUY")
-
-        if new_qty <= 0 or new_entry_price <= 0:
-            logger.error("❌ Ошибка считывания параметров новой позиции усреднения")
-            return
-
-        self.strategy.update({
-            "qty": new_qty,
-            "entry_price": new_entry_price,
-            "is_averaged": True,
-            "avg_limit_order_id": 0,
-            "avg_limit_client_id": ""
-        })
-        self.state_manager.save()
-
-        # Выставляем новый TP на 1.5% от обновленной ТВХ без стопа
-        tp_price, sl_price, target_percent = await self.place_tp_sl_orders(
-            side=side,
-            qty=new_qty,
-            entry_price=new_entry_price,
-            loss_streak=self.strategy.get("loss_streak", MAX_STREAK - 1),
-            is_averaged=True
-        )
-
-        formatted_entry = format_price(new_entry_price, self.tick_size)
-        coin = self.get_coin_name()
-
-        await send_tg_async(
-            self.session,
-            f"🎯 <b>ПОЗИЦИЯ УСРЕДНЕНА! ({self.active_symbol})</b>\n"
-            f"Новая ТВХ: <b>{formatted_entry}</b>\n"
-            f"Новый общий объем: <b>{new_qty} {coin}</b>\n"
-            f"🎯 Новый TP ({AVG_TAKE_PROFIT_PERCENT}%): <b>{tp_price}</b>\n"
-            f"🛑 Стоп-Лосс: <b>ОТКЛЮЧЕН</b>"
-        )
-
-    async def sync_existing_position(self):
-        pos = await self.get_raw_position(retries=5)
-        if pos:
-            amt = float(pos.get("positionAmt", 0.0))
-            entry_price = float(pos.get("entryPrice", 0.0))
-            if abs(amt) > 0 and entry_price > 0:
-                self.adopted_existing_position = True
-                side = "BUY" if amt > 0 else "SELL"
-                qty = abs(amt)
-                approx_usdc = round(qty * entry_price, 2)
-                
-                calculated_streak = 0
-                current_target_usdt = USDT_AMOUNT
-                for step in range(MAX_STREAK):
-                    if approx_usdc >= current_target_usdt * 0.85:
-                        calculated_streak = step
-                    current_target_usdt *= MARTINGALE_MULTIPLIER
-                
-                loss_streak = min(calculated_streak, MAX_STREAK - 1)
-                
-                is_averaged = self.strategy.get("is_averaged", False)
-                if loss_streak == MAX_STREAK - 1:
-                    base_5th_usdt = USDT_AMOUNT * (MARTINGALE_MULTIPLIER ** (MAX_STREAK - 1))
-                    if approx_usdc >= base_5th_usdt * 1.5:
-                        is_averaged = True
-
-                logger.info(f"🔍 Автоматически определено колено #{loss_streak + 1} по объему ~{approx_usdc} USDC (Усреднена: {is_averaged})")
-                
-                self.strategy.update({
-                    "usdt": max(approx_usdc, USDT_AMOUNT),
-                    "side": side,
-                    "entry_price": entry_price,
-                    "qty": qty,
-                    "loss_streak": loss_streak,
-                    "is_averaged": is_averaged,
-                    "state": "MONITOR",
-                    "entry_time": time.time(),
-                    "entry_order_id": 0
-                })
-                self.state_manager.save()
-
-                tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak, is_averaged=is_averaged)
-                formatted_entry = format_price(entry_price, self.tick_size)
-                current_step = loss_streak + 1
-                coin = self.get_coin_name()
-                
-                sl_display = f"🛑 SL: {sl_price}" if (loss_streak < MAX_STREAK - 1 and not is_averaged) else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено / Усреднено)</b>"
-                
-                await send_tg_async(
-                    self.session,
-                    f"🔄 <b>СИНХРОНИЗАЦИЯ {self.active_symbol}</b>\n"
-                    f"Позиция: <b>{side} {qty} {coin}</b> (~{approx_usdc} USDC)\n"
-                    f"Определено колено: <b>#{current_step}/{MAX_STREAK}</b>\n"
-                    f"Вход: {formatted_entry}\n"
-                    f"🎯 TP: {tp_price} ({target_percent}%)\n"
-                    f"{sl_display}"
-                )
-                return True
-        return False
-
-    async def setup_market(self):
-        await self._request("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"}, signed=True, suppress_error_codes=[-4059, -4067])
-        await self._request("POST", "/fapi/v1/leverage", {"symbol": self.active_symbol, "leverage": LEVERAGE}, signed=True)
-        await self._request("POST", "/fapi/v1/marginType", {"symbol": self.active_symbol, "marginType": "CROSSED"}, signed=True, suppress_error_codes=[-4046, -4067])
-
-    async def ws_ticker_loop(self):
-        if not websockets:
-            return
-        stream_name = f"{self.active_symbol.lower()}@ticker"
-        url = f"{self.ws_base_url}/{stream_name}"
-        while self.is_running:
+    async def fetch_trade_and_pnl_details(self):
+        """Собирает детальные данные по PnL, комиссиям и текущему балансу USDC"""
+        for attempt in range(5):
+            await asyncio.sleep(1.0)
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    logger.info(f"⚡ Market WebSocket подключен ({self.active_symbol})")
-                    async for msg in ws:
-                        if not self.is_running:
-                            break
-                        data = ujson.loads(msg)
-                        price = float(data.get("c", 0))
-                        if price > 0:
-                            self.latest_price = price
-                            self.last_price_time = time.time()
-            except Exception as e:
-                logger.warning(f"Ошибка WebSocket Ticker: {e}. Переподключение...")
-                await asyncio.sleep(3)
+                income_history = await self.exchange.fetch_income(SYMBOL, limit=15)
+                realized_pnl = 0.0
+                fee_paid = 0.0
 
-    async def ws_user_data_loop(self):
-        if not websockets:
-            return
-        while self.is_running:
-            key = await self.get_listen_key()
-            if not key:
-                await asyncio.sleep(5)
-                continue
-            url = f"{self.ws_base_url}/{key}"
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    logger.info("⚡ User Data Stream WS подключен")
-                    async for msg in ws:
-                        if not self.is_running:
-                            break
-                        try:
-                            data = ujson.loads(msg)
-                            event_type = data.get("e")
-                            
-                            if event_type == "ORDER_TRADE_UPDATE":
-                                order_data = data.get("o", {})
-                                status = order_data.get("X")
-                                client_id = str(order_data.get("c", ""))
-                                order_id = int(order_data.get("i", 0) or 0)
+                for item in reversed(income_history):
+                    income_type = item.get('type')
+                    amount = float(item.get('amount', 0.0))
 
-                                if status in ["FILLED", "EXECUTED"]:
-                                    saved_tp_id = int(self.strategy.get("tp_order_id", 0) or 0)
-                                    saved_tp_client = self.strategy.get("tp_client_id", "")
-                                    saved_avg_id = int(self.strategy.get("avg_limit_order_id", 0) or 0)
-                                    saved_avg_client = self.strategy.get("avg_limit_client_id", "")
+                    if income_type == 'REALIZED_PNL':
+                        realized_pnl += amount
+                    elif income_type == 'COMMISSION':
+                        fee_paid += abs(amount)
 
-                                    if ((saved_tp_client and client_id == saved_tp_client) or
-                                            (saved_tp_id and order_id == saved_tp_id)):
-                                        logger.info("🎯 WS: ТОЧНО ИСПОЛНЕН TP")
-                                        asyncio.create_task(self.handle_position_closed(close_type="TP"))
-                                    elif ((saved_avg_client and client_id == saved_avg_client) or
-                                          (saved_avg_id and order_id == saved_avg_id)):
-                                        logger.info("⚡ WS: ТОЧНО ИСПОЛНЕН ЛИМИТ УСРЕДНЕНИЯ")
-                                        asyncio.create_task(self.handle_averaging_executed())
-                            
-                            elif event_type in ["ALGO_UPDATE", "ALGO_ORDER_UPDATE"]:
-                                algo_data = data.get("o", {})
-                                status = algo_data.get("X", algo_data.get("s"))
-                                client_algo_id = str(algo_data.get("ca", algo_data.get("clientAlgoId", "")))
-                                algo_id = int(algo_data.get("i", algo_data.get("aid", algo_data.get("algoId", 0))) or 0)
-                                saved_sl_id = int(self.strategy.get("sl_algo_id", 0) or 0)
-                                saved_sl_client = self.strategy.get("sl_client_algo_id", "")
-                                if status in ["FILLED", "EXECUTED", "FINISHED"]:
-                                    if ((saved_sl_client and client_algo_id == saved_sl_client) or
-                                            (saved_sl_id and algo_id == saved_sl_id)):
-                                        logger.info("🛑 WS ALGO: ТОЧНО ИСПОЛНЕН SL")
-                                        asyncio.create_task(self.handle_position_closed(close_type="SL"))
-                            
-                            elif event_type == "ACCOUNT_UPDATE":
-                                acc_data = data.get("a", {})
-                                positions = acc_data.get("P", [])
-                                for p in positions:
-                                    if p.get("s") == self.active_symbol:
-                                        pa = float(p.get("pa", 0))
-                                        if pa == 0 and self.strategy["state"] == "MONITOR":
-                                            logger.info("📊 ACCOUNT_UPDATE: позиция закрыта")
-                                            asyncio.create_task(self.handle_position_closed())
-                        except Exception as e:
-                            logger.error(f"Ошибка обработки WS: {e}")
-            except Exception as e:
-                logger.warning(f"Ошибка UserStream WS: {e}. Переподключение...")
-                await asyncio.sleep(5)
-
-    async def get_last_executed_order(self):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
-        saved_tp_id = int(self.strategy.get("tp_order_id", 0) or 0)
-        saved_tp_client = self.strategy.get("tp_client_id", "")
-        saved_sl_id = int(self.strategy.get("sl_algo_id", 0) or 0)
-        saved_sl_client = self.strategy.get("sl_client_algo_id", "")
-        best = None
-
-        try:
-            res = await self._request("GET", "/fapi/v1/allOrders", {
-                "symbol": self.active_symbol,
-                "limit": 50
-            }, signed=True)
-            if isinstance(res, list):
-                for order in res:
-                    if order.get("status") != "FILLED":
-                        continue
-                    oid = int(order.get("orderId", order.get("i", 0)) or 0)
-                    cid = str(order.get("clientOrderId", ""))
-                    update_time = int(order.get("updateTime", 0) or 0)
-                    if update_time <= max(0, entry_time_ms - 5000):
-                        continue
-                    if (saved_tp_id and oid == saved_tp_id) or (saved_tp_client and cid == saved_tp_client):
-                        best = ("TP", update_time)
+                    if income_type == 'REALIZED_PNL':
                         break
-        except Exception as e:
-            logger.error(f"Ошибка проверки TP ордера: {e}")
 
-        if best is None and saved_sl_id > 0:
-            try:
-                res = await self._request("GET", "/fapi/v1/algoOpenOrders", {
-                    "symbol": self.active_symbol
-                }, signed=True, suppress_error_codes=[404, -2011])
-                if isinstance(res, list):
-                    for order in res:
-                        if order.get("status") not in ["FILLED", "FINISHED"]:
-                            continue
-                        aid = int(order.get("algoId", order.get("i", 0)) or 0)
-                        cid = str(order.get("clientAlgoId", order.get("ca", "")))
-                        update_time = int(order.get("updateTime", order.get("T", 0)) or 0)
-                        if update_time <= max(0, entry_time_ms - 5000):
-                            continue
-                        if (saved_sl_id and aid == saved_sl_id) or (saved_sl_client and cid == saved_sl_client):
-                            best = ("SL", update_time)
-                            break
+                net_profit = realized_pnl - fee_paid
+                
+                balance_data = await self.exchange.fetch_balance()
+                usdc_free = balance_data.get('USDC', {}).get('free', 0.0)
+                usdc_total = balance_data.get('USDC', {}).get('total', 0.0)
+
+                return {
+                    'gross': realized_pnl,
+                    'fee': fee_paid,
+                    'net': net_profit,
+                    'balance': usdc_total if usdc_total > 0 else usdc_free
+                }
             except Exception as e:
-                logger.error(f"Ошибка проверки SL algo history: {e}")
+                logger.error(f"⚠️ Ошибка получения деталей сделки: {e}")
+        return {'gross': 0.0, 'fee': 0.0, 'net': 0.0, 'balance': 0.0}
 
-        if best:
-            logger.info(f"🔎 Закрытие определено по идентификатору ордера: {best[0]}")
-            return best[0], None
-
-        trade = await self.get_last_closing_trade()
-        if trade:
-            exit_price = float(trade.get("price", 0) or 0)
-            tp_price = float(self.strategy.get("tp_price", 0) or 0)
-            sl_price = float(self.strategy.get("sl_price", 0) or 0)
-
-            candidates = []
-            if tp_price > 0:
-                candidates.append((abs(exit_price - tp_price), "TP"))
-            if sl_price > 0 and self.strategy.get("loss_streak", 0) < MAX_STREAK - 1:
-                candidates.append((abs(exit_price - sl_price), "SL"))
-
-            if candidates:
-                candidates.sort(key=lambda x: x[0])
-                result = candidates[0][1]
-                logger.warning(
-                    f"⚠️ ID ордера не найден. Определение по РЕАЛЬНОЙ цене исполнения: "
-                    f"exit={exit_price:.8f}, TP={tp_price:.8f}, SL={sl_price:.8f} => {result}"
-                )
-                return result, trade
-
-        logger.error("❌ Не удалось детерминированно определить TP/SL: нет подтвержденного ордера и closing trade")
-        return "UNKNOWN", None
-
-    async def get_last_closing_trade(self):
-        entry_time_ms = int(float(self.strategy.get("entry_time", 0) or 0) * 1000)
-        side = self.strategy.get("side", "BUY")
-        closing_side = "SELL" if side == "BUY" else "BUY"
-
-        if entry_time_ms <= 0:
-            return None
-
+    async def audit_and_sync_all_orders(self):
         try:
-            res = await self._request("GET", "/fapi/v1/userTrades", {
-                "symbol": self.active_symbol,
-                "startTime": entry_time_ms,
-                "limit": 1000
-            }, signed=True, weight=5)
-            if not isinstance(res, list):
-                return None
+            open_orders = await self.exchange.fetch_open_orders(SYMBOL)
+            positions = await self.exchange.fetch_positions([SYMBOL])
 
-            candidates = []
-            for trade in res:
-                t = int(trade.get("time", 0) or 0)
-                if t < entry_time_ms:
-                    continue
-                if str(trade.get("side", "")).upper() != closing_side:
-                    continue
-                q = abs(float(trade.get("qty", trade.get("baseQty", 0)) or 0))
-                if q <= 0:
-                    continue
-                candidates.append(trade)
+            long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+            short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
 
-            if not candidates:
-                return None
+            existing_tp_long = None
+            existing_tp_short = None
+            existing_grid_long = {}
+            existing_grid_short = {}
 
-            candidates.sort(key=lambda x: int(x.get("time", 0) or 0), reverse=True)
-            return candidates[0]
-        except Exception as e:
-            logger.error(f"Ошибка получения фактического closing trade: {e}")
-            return None
-
-    async def _get_trades_for_order(self, order_id, retries=8):
-        if not order_id:
-            return []
-
-        for attempt in range(1, retries + 1):
-            try:
-                res = await self._request("GET", "/fapi/v1/userTrades", {
-                    "symbol": self.active_symbol,
-                    "orderId": int(order_id),
-                    "limit": 1000
-                }, signed=True, weight=5)
-                if isinstance(res, list) and res:
-                    return [t for t in res if int(t.get("orderId", 0) or 0) == int(order_id)]
-            except Exception as e:
-                logger.warning(f"Ошибка получения fills orderId={order_id}, попытка {attempt}: {e}")
-
-            await asyncio.sleep(0.35)
-
-        return []
-
-    async def calculate_realized_pnl(self, entry_price, exit_price, qty, side, close_trade=None):
-        entry_order_id = int(self.strategy.get("entry_order_id", 0) or 0)
-        entry_trades = await self._get_trades_for_order(entry_order_id) if entry_order_id else []
-
-        if not entry_trades:
-            logger.warning(
-                f"⚠️ Точные fills входа не найдены (entry_order_id={entry_order_id}). "
-                "Комиссия входа не будет выдумываться."
-            )
-
-        if close_trade is None:
-            close_trade = await self.get_last_closing_trade()
-
-        close_order_id = int(close_trade.get("orderId", 0) or 0) if close_trade else 0
-        close_trades = await self._get_trades_for_order(close_order_id) if close_order_id else []
-
-        if not close_trades:
-            logger.warning(
-                f"⚠️ Точные fills закрытия еще не получены (close_order_id={close_order_id}). "
-                "PnL не рассчитываем приблизительно."
-            )
-            return None
-
-        closing_side = "SELL" if side == "BUY" else "BUY"
-        close_trades = [
-            t for t in close_trades
-            if str(t.get("side", "")).upper() == closing_side
-        ]
-        if not close_trades:
-            logger.warning("⚠️ В closing order нет fills нужной стороны.")
-            return None
-
-        gross = sum(float(t.get("realizedPnl", 0) or 0) for t in close_trades)
-        entry_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in entry_trades)
-        close_fee = sum(abs(float(t.get("commission", 0) or 0)) for t in close_trades)
-
-        fee_assets = sorted({
-            str(t.get("commissionAsset", ""))
-            for t in (entry_trades + close_trades)
-            if t.get("commissionAsset")
-        })
-
-        if fee_assets and any(asset not in {"USDC", ""} for asset in fee_assets):
-            logger.warning(
-                f"⚠️ Комиссия пришла не только в USDC: {fee_assets}. "
-                "Значения не конвертируются искусственно."
-            )
-
-        total_fee = entry_fee + close_fee
-        net = gross - total_fee
-
-        exit_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in close_trades)
-        exit_notional = sum(
-            abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
-            float(t.get("price", 0) or 0)
-            for t in close_trades
-        )
-        actual_exit_price = exit_notional / exit_qty if exit_qty > 0 else 0.0
-
-        entry_qty = sum(abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) for t in entry_trades)
-        entry_notional = sum(
-            abs(float(t.get("qty", t.get("baseQty", 0)) or 0)) *
-            float(t.get("price", 0) or 0)
-            for t in entry_trades
-        )
-
-        if entry_notional <= 0:
-            entry_notional = abs(entry_price * (exit_qty if exit_qty > 0 else qty))
-
-        percent = (net / entry_notional) * 100 if entry_notional > 0 else 0.0
-
-        logger.info(
-            f"💰 ФАКТИЧЕСКИЙ PnL: gross={gross:.8f} | "
-            f"entry_fee={entry_fee:.8f} | close_fee={close_fee:.8f} | "
-            f"net={net:.8f} | entry_order={entry_order_id} | close_order={close_order_id}"
-        )
-
-        return {
-            "gross": gross,
-            "entry_fee": entry_fee,
-            "close_fee": close_fee,
-            "fee": total_fee,
-            "net": net,
-            "percent": percent,
-            "exit_price": actual_exit_price,
-            "exit_qty": exit_qty,
-            "entry_qty": entry_qty,
-            "entry_notional": entry_notional,
-            "close_order_id": close_order_id,
-            "entry_order_id": entry_order_id,
-            "fee_assets": fee_assets
-        }
-
-    async def handle_position_closed(self, close_type=None):
-        if self.is_processing_close:
-            logger.info("Уже обрабатываем закрытие, пропускаем")
-            return
-        if self.strategy["state"] != "MONITOR":
-            logger.info(f"Стратегия в состоянии {self.strategy['state']}, пропускаем")
-            return
-        
-        self.is_processing_close = True
-        try:
-            if close_type is None:
-                close_type, close_trade = await self.get_last_executed_order()
-            else:
-                close_trade = None
-
-            if close_type == "UNKNOWN" or close_type is None:
-                logger.warning("⏳ TP/SL пока не подтвержден Binance. Повторная проверка через 0.5 сек...")
-                await asyncio.sleep(0.5)
-                close_type, close_trade = await self.get_last_executed_order()
-                if close_type == "UNKNOWN" or close_type is None:
-                    logger.error("❌ TP/SL не подтвержден. Состояние стратегии НЕ изменяем.")
-                    await send_tg_async(
-                        self.session,
-                        "⚠️ <b>ЗАКРЫТИЕ ПОДТВЕРЖДЕНО, НО TP/SL ЕЩЕ НЕ ОПРЕДЕЛЕН</b>\n"
-                        "Стратегия ждет подтверждение Binance и не делает ошибочный переворот.",
-                        is_error=True,
-                        error_key="unknown_close"
-                    )
-                    return
-
-            logger.info(f"Обработка закрытия позиции: {close_type}")
-
-            side = self.strategy.get("side", "BUY")
-            entry_price = float(self.strategy.get("entry_price", 0) or 0)
-            qty = float(self.strategy.get("qty", 0) or 0)
-            loss_streak = self.strategy.get("loss_streak", 0)
-            was_averaged = self.strategy.get("is_averaged", False)
-
-            pnl_data = await self.calculate_realized_pnl(
-                entry_price,
-                float(close_trade.get("price", 0)) if close_trade else 0.0,
-                qty,
-                side,
-                close_trade=close_trade
-            )
-            
-            if close_type == "TP":
-                current_step = loss_streak + 1
-                coin = self.get_coin_name()
+            for o in open_orders:
+                o_id = str(o['id'])
+                o_pos_side = str(o.get('info', {}).get('positionSide', '')).upper()
+                o_side = str(o['side']).upper()
                 
-                # Отдельное уникальное сообщение при закрытии по Тейк-Профиту ПОСЛЕ УСРЕДНЕНИЯ
-                if was_averaged:
-                    msg = f"🎉 <b>ТЕЙК-ПРОФИТ ПОСЛЕ УСРЕДНЕНИЯ!</b> ({self.active_symbol})\n"
-                    msg += f"Закрыта усредненная позиция на 5-м колене\n"
-                    msg += f"Направление: <b>{side}</b> | Объем: <b>{qty} {coin}</b>\n"
-                    if pnl_data:
-                        sign = "+" if pnl_data["net"] >= 0 else ""
-                        msg += f"💰 Итоговый PnL: <b>{sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)</b>\n"
-                        msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
-                        msg += f"💸 Комиссии: вход {pnl_data['entry_fee']:.4f} | выход {pnl_data['close_fee']:.4f}\n"
-                    msg += f"💳 Баланс: <b>{await self.get_free_margin():.2f} USDC</b>"
+                if o_pos_side == 'LONG' and o_side == 'SELL':
+                    existing_tp_long = o
+                elif o_pos_side == 'SHORT' and o_side == 'BUY':
+                    existing_tp_short = o
+                elif o_pos_side == 'LONG' and o_side == 'BUY':
+                    existing_grid_long[o_id] = o
+                elif o_pos_side == 'SHORT' and o_side == 'SELL':
+                    existing_grid_short[o_id] = o
+
+            self.active_limit_orders.clear()
+            self.long_tp_order_id = None
+            self.short_tp_order_id = None
+
+            # --- 1. LONG TP ---
+            if long_pos:
+                l_contracts = float(long_pos['contracts'])
+                if existing_tp_long:
+                    self.long_tp_order_id = str(existing_tp_long['id'])
                 else:
-                    # Стандартное сообщение для обычного закрытия по TP
-                    msg = f"✅ <b>ТЕЙК-ПРОФИТ!</b> ({self.active_symbol})\n"
-                    msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
-                    msg += f"Направление: {side}\n"
-                    if pnl_data:
-                        sign = "+" if pnl_data["net"] >= 0 else ""
-                        msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                        msg += f"📈 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
-                        msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC\n"
-                        msg += f"💳 Баланс: {await self.get_free_margin():.2f} USDC"
-                    else:
-                        msg += "📊 PnL: данные Binance еще не получены"
-                
-                await send_tg_async(self.session, msg)
-                
-                self.strategy.update({
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "entry_order_id": 0,
-                    "tp_order_id": 0,
-                    "tp_client_id": "",
-                    "sl_algo_id": 0,
-                    "sl_client_algo_id": "",
-                    "avg_limit_order_id": 0,
-                    "avg_limit_client_id": "",
-                    "avg_limit_price": 0.0,
-                    "is_averaged": False,
-                    "tp_price": 0.0,
-                    "sl_price": 0.0,
-                    "last_tp_time": time.time(),
-                    "state": "ENTRY"
-                })
-                self.state_manager.save()
-                
-            elif close_type == "SL":
-                current_step = loss_streak + 1
-                if pnl_data:
-                    sign = "+" if pnl_data["net"] >= 0 else ""
-                    sl_msg = f"🛑 <b>СТОП-ЛОСС!</b> ({self.active_symbol})\n"
-                    sl_msg += f"Колено: #{current_step}/{MAX_STREAK}\n"
-                    sl_msg += f"Направление: {side}\n"
-                    sl_msg += f"💰 PnL: {sign}{pnl_data['net']:.2f} USDC ({sign}{pnl_data['percent']:.2f}%)\n"
-                    sl_msg += f"📉 Выход: {pnl_data['exit_price']:.2f} | Gross: {pnl_data['gross']:.2f} USDC\n"
-                    sl_msg += f"💸 Комиссия вход: {pnl_data['entry_fee']:.4f} | выход: {pnl_data['close_fee']:.4f} | всего: {pnl_data['fee']:.4f} USDC"
-                    await send_tg_async(self.session, sl_msg)
-                else:
-                    await send_tg_async(
-                        self.session,
-                        f"🛑 <b>СТОП-ЛОСС!</b> ({self.active_symbol})\n"
-                        "⚠️ Точные fills Binance еще не получены — PnL НЕ подменен расчетом по цене. "
-                        "Переворот выполняется по обычной логике."
-                    )
-
-                next_streak = loss_streak + 1
-                if next_streak >= MAX_STREAK:
-                    self.strategy.update({
-                        "state": "ENTRY",
-                        "loss_streak": 0,
-                        "usdt": USDT_AMOUNT,
-                        "side": "BUY",
-                        "qty": 0.0,
-                        "entry_price": 0.0,
-                        "entry_order_id": 0,
-                        "avg_limit_order_id": 0,
-                        "avg_limit_client_id": "",
-                        "avg_limit_price": 0.0,
-                        "is_averaged": False,
-                        "last_tp_time": 0.0
-                    })
-                    self.state_manager.save()
-                    return
-                
-                next_usdt = round(self.strategy["usdt"] * MARTINGALE_MULTIPLIER, 2)
-                
-                self.strategy["state"] = "PROCESSING"
-                self.strategy["loss_streak"] = next_streak
-                self.state_manager.save()
-                
-                pos = await self.get_raw_position(retries=5)
-                while pos and abs(float(pos.get("positionAmt", 0.0))) != 0:
-                    logger.info("Ожидание полного закрытия позиции перед переворотом...")
-                    await asyncio.sleep(0.5)
-                    pos = await self.get_raw_position(retries=2)
-                
-                success = await self.execute_flip(side, next_usdt, next_streak)
-                if success:
-                    self.strategy["state"] = "MONITOR"
-                else:
-                    logger.error("Сбой переворота, откат состояния к MONITOR")
-                    self.strategy["state"] = "MONITOR"
-                self.state_manager.save()
-                
-            else:
-                logger.warning(f"Неизвестный тип закрытия: {close_type}")
-                self.strategy.update({
-                    "state": "ENTRY",
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "side": "BUY",
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "entry_order_id": 0,
-                    "avg_limit_order_id": 0,
-                    "avg_limit_client_id": "",
-                    "avg_limit_price": 0.0,
-                    "is_averaged": False,
-                    "last_tp_time": 0.0
-                })
-                self.state_manager.save()
-        finally:
-            self.is_processing_close = False
-
-    async def execute_flip(self, current_side, next_usdt, loss_streak):
-        new_side = "SELL" if current_side == "BUY" else "BUY"
-        last_price = await self.get_market_data()
-        if last_price <= 0:
-            logger.error("Невозможно выполнить переворот: цена равна 0")
-            return False
-
-        pos = await self.get_raw_position(retries=5)
-        if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-            logger.error("🛡️ ПЕРЕВОРОТ ЗАБЛОКИРОВАН: старая позиция еще не закрыта полностью.")
-            return False
-
-        await self.cancel_all_orders()
-        new_raw_qty = next_usdt / last_price
-        new_qty = format_qty(new_raw_qty, self.step_size)
-
-        res = await self._request("POST", "/fapi/v1/order", {
-            "symbol": self.active_symbol,
-            "side": new_side,
-            "positionSide": "BOTH",
-            "type": "MARKET",
-            "quantity": new_qty,
-            "newClientOrderId": f"flip_{uuid.uuid4().hex[:10]}"
-        }, signed=True, weight=1)
-
-        if isinstance(res, dict) and res.get("orderId"):
-            order_id = res.get("orderId")
-            entry_price = await self.get_actual_entry_price(order_id, side=new_side)
-            if entry_price <= 0:
-                entry_price = float(res.get("avgPrice", 0))
-                if entry_price == 0:
-                    entry_price = last_price
-
-            self.strategy.update({
-                "side": new_side,
-                "usdt": next_usdt,
-                "qty": new_qty,
-                "entry_price": entry_price,
-                "entry_time": time.time(),
-                "entry_order_id": int(order_id),
-                "is_averaged": False
-            })
-            self.state_manager.save()
-
-            current_step = loss_streak + 1
-            tp_price, sl_price, target_percent = await self.place_tp_sl_orders(new_side, new_qty, entry_price, loss_streak)
-            formatted_entry = format_price(entry_price, self.tick_size)
-
-            sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
-            coin = self.get_coin_name()
-            
-            # Если это 5-е колено, сразу добавляем в сообщение инфо про выставляемый лимит усреднения
-            avg_limit_text = ""
-            if loss_streak == MAX_STREAK - 1:
-                avg_price = float(self.strategy.get("avg_limit_price", 0.0))
-                avg_limit_text = f"\n📌 <b>Усреднение:</b> Выставлен LIMIT ордер {new_qty} {coin} по {avg_price} (±{AVG_LIMIT_OFFSET_PERCENT}%)"
-
-            await send_tg_async(
-                self.session,
-                f"🛑 <b>СТОП-ЛОСС ➔ ПЕРЕВОРОТ! ({self.active_symbol})</b>\n"
-                f"{current_side} → {new_side}\n"
-                f"Вход: {formatted_entry} | Объем: {new_qty} {coin} (~{next_usdt} USDC)\n"
-                f"🎯 TP: {tp_price} ({target_percent}%) | {sl_display}\n"
-                f"Колено: #{current_step}/{MAX_STREAK}{avg_limit_text}"
-            )
-            return True
-        else:
-            logger.error(f"Ошибка исполнения переворота: {res}")
-            return False
-
-    async def start(self):
-        self.session = aiohttp.ClientSession()
-        self.active_symbol = SYMBOL
-        
-        await self.fetch_symbol_info()
-        await self.setup_market()
-        
-        asyncio.create_task(self.ws_ticker_loop())
-        asyncio.create_task(self.ws_user_data_loop())
-        asyncio.create_task(self.keepalive_listen_key())
-        
-        has_pos = await self.sync_existing_position()
-        self.startup_sync_complete = True
-
-        if has_pos:
-            self.adopted_existing_position = True
-            self.strategy["state"] = "MONITOR"
-            self.state_manager.save()
-            logger.info("🛡️ СУЩЕСТВУЮЩАЯ ПОЗИЦИЯ ПОДХВАЧЕНА. ДОПОЛНИТЕЛЬНЫЙ ВХОД ЗАПРЕЩЕН.")
-        else:
-            if self.strategy["state"] == "MONITOR":
-                self.strategy.update({
-                    "state": "ENTRY",
-                    "usdt": USDT_AMOUNT,
-                    "loss_streak": 0,
-                    "side": "BUY",
-                    "qty": 0.0,
-                    "entry_price": 0.0,
-                    "entry_order_id": 0,
-                    "avg_limit_order_id": 0,
-                    "avg_limit_client_id": "",
-                    "avg_limit_price": 0.0,
-                    "is_averaged": False,
-                    "last_tp_time": 0.0
-                })
-                self.state_manager.save()
-            await send_tg_async(
-                self.session,
-                f"🤖 <b>БОТ ЗАПУЩЕН</b>\n"
-                f"{self.active_symbol} | Плечо: {LEVERAGE}x\n"
-                f"Старт: {USDT_AMOUNT} USDC | Множитель: {MARTINGALE_MULTIPLIER}x\n"
-                f"MAX_STREAK: {MAX_STREAK} | TP: {TAKE_PROFIT_PERCENT}% | SL: {STOP_LOSS_PERCENT}%"
-            )
-
-        await self.strategy_loop()
-
-    async def strategy_loop(self):
-        while self.is_running:
-            await asyncio.sleep(0.1)
-
-            try:
-                if not self.startup_sync_complete:
-                    continue
-
-                if self.strategy["state"] == "ENTRY":
-                    pos = await self.get_raw_position(retries=3)
-                    if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-                        logger.warning("🛡️ В ENTRY обнаружена существующая позиция. НОВЫЙ MARKET-ОРДЕР НЕ ОТПРАВЛЯЕМ. Подхватываем позицию...")
-                        self.adopted_existing_position = True
-                        await self.sync_existing_position()
-                        continue
-
-                    if self.adopted_existing_position:
-                        pos = await self.get_raw_position(retries=2)
-                        if pos is not None and abs(float(pos.get("positionAmt", 0.0))) > 0:
-                            logger.warning("🛡️ Подхваченная позиция все еще существует. Вход заблокирован.")
-                            await asyncio.sleep(0.5)
-                            continue
-                        self.adopted_existing_position = False
-
-                    last_price = await self.get_market_data()
-                    if last_price <= 0:
-                        continue
-
-                    last_tp = self.strategy.get("last_tp_time", 0.0)
-                    is_continuation = last_tp > 0 and (time.time() - last_tp < CONTINUATION_TTL_SECONDS)
-
-                    atr_percent, candle_color = await self.get_atr_and_candle_color()
-
-                    if atr_percent < MIN_ATR_PERCENT:
-                        logger.info(f"⏳ Рынок в затишье (ATR {atr_percent:.3f}% < {MIN_ATR_PERCENT}%). Ожидание...")
-                        await asyncio.sleep(10)
-                        continue
-
-                    if is_continuation:
-                        side = self.strategy.get("side", "BUY")
-                        logger.info(f"📈 Продолжение тренда после TP: вход по сохраненному направлению {side}")
-                    else:
-                        if last_tp > 0:
-                            logger.info("⏳ TTL продолжения тренда истек (> 5 мин). Переход к чистому старту по свече.")
-                            self.strategy["last_tp_time"] = 0.0
-                            self.state_manager.save()
-                        
-                        side = candle_color
-                        self.strategy["side"] = side
-                        self.state_manager.save()
-                        logger.info(f"🟢 Чистый старт: направление по цвету 5m свечи => {side}")
-
-                    pos = await self.get_raw_position(retries=2)
-                    if pos and abs(float(pos.get("positionAmt", 0))) > 0:
-                        logger.warning("Позиция уже существует. Синхронизация...")
-                        await self.sync_existing_position()
-                        continue
-
-                    self.strategy["state"] = "PROCESSING"
-                    raw_qty = self.strategy["usdt"] / last_price
-                    qty = format_qty(raw_qty, self.step_size)
-
-                    await self.cancel_all_orders()
-
-                    res = await self._request("POST", "/fapi/v1/order", {
-                        "symbol": self.active_symbol,
-                        "side": side,
-                        "positionSide": "BOTH",
-                        "type": "MARKET",
-                        "quantity": qty,
-                        "newClientOrderId": f"e_{uuid.uuid4().hex[:10]}"
-                    }, signed=True, weight=1)
-
-                    if isinstance(res, dict) and res.get("orderId"):
-                        order_id = res.get("orderId")
-                        entry_price = await self.get_actual_entry_price(order_id, side=side)
-                        if entry_price <= 0:
-                            entry_price = float(res.get("avgPrice", 0))
-                            if entry_price == 0:
-                                entry_price = last_price
-
-                        loss_streak = self.strategy.get("loss_streak", 0)
-                        self.strategy.update({
-                            "entry_price": entry_price,
-                            "qty": qty,
-                            "entry_time": time.time(),
-                            "entry_order_id": int(order_id),
-                            "is_averaged": False
-                        })
-                        self.state_manager.save()
-
-                        tp_price, sl_price, target_percent = await self.place_tp_sl_orders(side, qty, entry_price, loss_streak)
-
-                        self.strategy["state"] = "MONITOR"
-                        self.state_manager.save()
-                        icon = "🟢" if side == "BUY" else "🔻"
-                        current_step = loss_streak + 1
-                        
-                        sl_display = f"🛑 SL: {sl_price}" if loss_streak < MAX_STREAK - 1 else f"🛑 SL: <b>ОТКЛЮЧЕН ({MAX_STREAK}-е колено)</b>"
-                        coin = self.get_coin_name()
-                        
-                        # Сообщение в TG с информацией о выставляемом лимитнике для 5-го колена
-                        avg_limit_text = ""
-                        if loss_streak == MAX_STREAK - 1:
-                            avg_price = float(self.strategy.get("avg_limit_price", 0.0))
-                            avg_limit_text = f"\n📌 <b>Усреднение:</b> Выставлен LIMIT ордер {qty} {coin} по {avg_price} (±{AVG_LIMIT_OFFSET_PERCENT}%)"
-
-                        await send_tg_async(
-                            self.session,
-                            f"{icon} <b>ОТКРЫТА ПОЗИЦИЯ ({side}) — {self.active_symbol}</b>\n"
-                            f"Цена: {entry_price} | Объем: {qty} {coin} (~{self.strategy['usdt']} USDC)\n"
-                            f"🎯 TP: {tp_price} ({target_percent}%) | {sl_display}\n"
-                            f"Колено: #{current_step}/{MAX_STREAK}{avg_limit_text}"
+                    l_entry = float(long_pos['entryPrice'])
+                    tp_price = self.round_price(l_entry * (1.0 + (WINNER_TAKE_PROFIT_PCT / 100.0)))
+                    tp_qty = self.round_amount(l_contracts)
+                    try:
+                        new_ord = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'sell', tp_qty, tp_price,
+                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
                         )
+                        self.long_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан TP_LONG по ${tp_price:,.2f}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания TP_LONG: {e}")
+
+            # --- 2. SHORT TP ---
+            if short_pos:
+                s_contracts = float(short_pos['contracts'])
+                if existing_tp_short:
+                    self.short_tp_order_id = str(existing_tp_short['id'])
+                else:
+                    s_entry = float(short_pos['entryPrice'])
+                    tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
+                    tp_qty = self.round_amount(s_contracts)
+                    try:
+                        new_ord = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'buy', tp_qty, tp_price,
+                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
+                        )
+                        self.short_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан TP_SHORT по ${tp_price:,.2f}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания TP_SHORT: {e}")
+
+            # --- 3. LONG Grid ---
+            if long_pos and self.initial_long_entry > 0:
+                if existing_grid_long:
+                    grid_id, grid_obj = list(existing_grid_long.items())[0]
+                    next_step = self.long_loser_step + 1
+                    self.active_limit_orders[f"LONG_{next_step}"] = grid_id
+                else:
+                    next_step = self.long_loser_step + 1
+                    if next_step <= GRID_LEVELS:
+                        target_usdc = get_step_usdc_volume(next_step)
+                        dist_pct = get_grid_step_percent(next_step)
+                        grid_price = self.round_price(self.initial_long_entry * (1.0 - (dist_pct / 100.0)))
+                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
+                        try:
+                            new_ord = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'buy', grid_qty, grid_price,
+                                params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
+                            )
+                            self.active_limit_orders[f"LONG_{next_step}"] = str(new_ord['id'])
+                            logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан лимитник усреднения LONG #{next_step} по ${grid_price:,.2f}")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания лимитника LONG: {e}")
+
+            # --- 4. SHORT Grid ---
+            if short_pos and self.initial_short_entry > 0:
+                if existing_grid_short:
+                    grid_id, grid_obj = list(existing_grid_short.items())[0]
+                    next_step = self.short_loser_step + 1
+                    self.active_limit_orders[f"SHORT_{next_step}"] = grid_id
+                else:
+                    next_step = self.short_loser_step + 1
+                    if next_step <= GRID_LEVELS:
+                        target_usdc = get_step_usdc_volume(next_step)
+                        dist_pct = get_grid_step_percent(next_step)
+                        grid_price = self.round_price(self.initial_short_entry * (1.0 + (dist_pct / 100.0)))
+                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
+                        try:
+                            new_ord = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'sell', grid_qty, grid_price,
+                                params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
+                            )
+                            self.active_limit_orders[f"SHORT_{next_step}"] = str(new_ord['id'])
+                            logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан лимитник усреднения SHORT #{next_step} по ${grid_price:,.2f}")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания лимитника SHORT: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в аудите ордеров: {e}")
+
+    async def recover_state_or_init(self):
+        async with self.exec_lock:
+            logger.info(f"🔄 Сканирование биржи и подхват существующих позиций для {SYMBOL_DISPLAY}...")
+
+            positions = []
+            for attempt in range(3):
+                try:
+                    positions = await self.exchange.fetch_positions([SYMBOL])
+                    break
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка запроса позиций: {e}")
+                    await asyncio.sleep(1)
+
+            ticker = await self.exchange.fetch_ticker(SYMBOL)
+            current_price = float(ticker['last'])
+
+            long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+            short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
+
+            # --- LONG ---
+            if long_pos:
+                long_contracts = float(long_pos['contracts'])
+                self.long_entry_price = float(long_pos['entryPrice'])
+                self.initial_long_entry = self.long_entry_price
+                self.long_contracts_prev = long_contracts
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG успешно подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.long_entry_price:,.2f} | Объем: {long_contracts}"
+                )
+            else:
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден! Открываем базу...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
+                l_entry, l_contracts = await self.get_actual_position_entry_price('LONG')
+                self.long_entry_price = l_entry if l_entry > 0 else current_price
+                self.initial_long_entry = self.long_entry_price
+                self.long_contracts_prev = l_contracts if l_contracts > 0 else base_qty
+                self.long_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}"
+                )
+
+            # --- SHORT ---
+            if short_pos:
+                short_contracts = float(short_pos['contracts'])
+                self.short_entry_price = float(short_pos['entryPrice'])
+                self.initial_short_entry = self.short_entry_price
+                self.short_contracts_prev = short_contracts
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT успешно подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.short_entry_price:,.2f} | Объем: {short_contracts}"
+                )
+            else:
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден! Открываем базу...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
+                s_entry, s_contracts = await self.get_actual_position_entry_price('SHORT')
+                self.short_entry_price = s_entry if s_entry > 0 else current_price
+                self.initial_short_entry = self.short_entry_price
+                self.short_contracts_prev = s_contracts if s_contracts > 0 else base_qty
+                self.short_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}"
+                )
+
+            await self.audit_and_sync_all_orders()
+
+    async def reopen_winner_position(self, current_price, winner_side):
+        async with self.exec_lock:
+            icon = "🟢" if winner_side == 'LONG' else "🔻"
+            direction_text = "BUY" if winner_side == 'LONG' else "SELL"
+            
+            triggered_step = self.long_loser_step if winner_side == 'LONG' else self.short_loser_step
+            step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
+
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
+
+            qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+            side = 'buy' if winner_side == 'LONG' else 'sell'
+
+            try:
+                await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
+                actual_entry, actual_contracts = await self.get_actual_position_entry_price(winner_side)
+                
+                if actual_entry > 0:
+                    if winner_side == 'LONG':
+                        self.long_entry_price = actual_entry
+                        self.initial_long_entry = actual_entry
+                        self.long_contracts_prev = actual_contracts
+                        self.long_loser_step = 0
                     else:
-                        logger.error(f"Ошибка открытия позиции: {res}")
-                        self.strategy["state"] = "ENTRY"
+                        self.short_entry_price = actual_entry
+                        self.initial_short_entry = actual_entry
+                        self.short_contracts_prev = actual_contracts
+                        self.short_loser_step = 0
+
+                details = await self.fetch_trade_and_pnl_details()
+                net_pnl = details['net']
+                gross_pnl = details['gross']
+                fee_total = details['fee']
+                wallet_balance = details['balance']
+                
+                pnl_percent = (net_pnl / BASE_ORDER_USDC) * 100.0 if BASE_ORDER_USDC > 0 else 0.0
+
+                tg_msg = (
+                    f"✅ <b>ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                    f"Направление: {direction_text}\n"
+                    f"💰 PnL: <b>{net_pnl:+.2f} USDC ({pnl_percent:+.2f}%)</b>\n"
+                    f"📈 Выход: {current_price:,.2f} | Gross: {gross_pnl:+.2f} USDC\n"
+                    f"💸 Комиссия всего: {fee_total:.4f} USDC\n"
+                    f"💳 Баланс: {wallet_balance:.2f} USDC\n"
+                    f"🔄 <b>Новый вход:</b> ${actual_entry:,.2f} | Объем: {actual_contracts}"
+                )
+                await send_tg_message(self.http_session, tg_msg)
+            except Exception as e:
+                logger.error(f"❌ Ошибка переоткрытия {winner_side}: {e}")
+
+            await self.audit_and_sync_all_orders()
+
+    async def main_loop(self):
+        logger.info(f"✅ Главный цикл мониторинга для {SYMBOL_DISPLAY} запущен.")
+        while self.is_running:
+            try:
+                open_orders = await self.exchange.fetch_open_orders(SYMBOL)
+                open_order_ids = set(str(o['id']) for o in open_orders)
+                positions = await self.exchange.fetch_positions([SYMBOL])
+
+                long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+                short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
+
+                long_contracts = float(long_pos['contracts']) if long_pos else 0.0
+                short_contracts = float(short_pos['contracts']) if short_pos else 0.0
+
+                # --- 1. TP LONG ---
+                if self.long_tp_order_id and self.long_tp_order_id not in open_order_ids:
+                    if long_contracts < self.long_contracts_prev:
+                        self.long_tp_order_id = None
+                        for o in open_orders:
+                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
+                                try:
+                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
+                                except Exception:
+                                    pass
+                        ticker = await self.exchange.fetch_ticker(SYMBOL)
+                        await self.reopen_winner_position(float(ticker['last']), 'LONG')
                         await asyncio.sleep(0.5)
+                        continue
 
-                elif self.strategy["state"] == "MONITOR":
-                    now = time.time()
-                    if now - self.last_pos_check_time > 2.0:
-                        self.last_pos_check_time = now
-                        pos = await self.get_raw_position(retries=2)
-                        if pos is not None:
-                            pos_amt = abs(float(pos.get("positionAmt", 0.0)))
-                            if pos_amt == 0:
-                                logger.info("🔍 Позиция закрыта, запускаем обработку")
-                                if not self.is_processing_close:
-                                    asyncio.create_task(self.handle_position_closed())
-                            else:
-                                current_entry_price = float(pos.get("entryPrice", self.strategy.get("entry_price", 0.0)))
-                                saved_entry_price = float(self.strategy.get("entry_price", 0.0))
-                                saved_qty = float(self.strategy.get("qty", 0.0))
-                                is_averaged = self.strategy.get("is_averaged", False)
+                # --- 2. TP SHORT ---
+                if self.short_tp_order_id and self.short_tp_order_id not in open_order_ids:
+                    if short_contracts < self.short_contracts_prev:
+                        self.short_tp_order_id = None
+                        for o in open_orders:
+                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
+                                try:
+                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
+                                except Exception:
+                                    pass
+                        ticker = await self.exchange.fetch_ticker(SYMBOL)
+                        await self.reopen_winner_position(float(ticker['last']), 'SHORT')
+                        await asyncio.sleep(0.5)
+                        continue
 
-                                if not is_averaged and self.strategy.get("loss_streak", 0) == MAX_STREAK - 1:
-                                    if pos_amt > saved_qty * 1.1 or (saved_entry_price > 0 and abs(current_entry_price - saved_entry_price) / saved_entry_price > 0.01):
-                                        logger.info("🔍 Обнаружено изменение объема/ТВХ на 5-м колене (исполнен/передвинут лимитник)")
-                                        asyncio.create_task(self.handle_averaging_executed())
-                                else:
-                                    self.strategy.update({
-                                        "entry_price": current_entry_price,
-                                        "qty": pos_amt
-                                    })
-                                    self.state_manager.save()
+                # --- 3. Grid Averaging LONG ---
+                if long_contracts > self.long_contracts_prev:
+                    async with self.exec_lock:
+                        self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
+                        self.long_contracts_prev = long_contracts
+                        if long_pos:
+                            self.long_entry_price = float(long_pos['entryPrice'])
+
+                        msg = f"🎯 🟢 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.long_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
+                        logger.info(msg)
+                        await send_tg_message(self.http_session, msg)
+                        await self.audit_and_sync_all_orders()
+                        continue
+
+                # --- 4. Grid Averaging SHORT ---
+                if short_contracts > self.short_contracts_prev:
+                    async with self.exec_lock:
+                        self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
+                        self.short_contracts_prev = short_contracts
+                        if short_pos:
+                            self.short_entry_price = float(short_pos['entryPrice'])
+
+                        msg = f"🎯 🔻 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.short_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
+                        logger.info(msg)
+                        await send_tg_message(self.http_session, msg)
+                        await self.audit_and_sync_all_orders()
+                        continue
+
+                self.long_contracts_prev = long_contracts
+                self.short_contracts_prev = short_contracts
+
+                await self.audit_and_sync_all_orders()
 
             except Exception as e:
-                logger.error(f"Ошибка в цикле strategy_loop: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"⚠️ Ошибка в main_loop: {e}")
+                await asyncio.sleep(2)
 
-bot = BinanceMartingaleBot()
+            await asyncio.sleep(1)
+
+    async def run(self):
+        while self.is_running:
+            try:
+                await self.initialize()
+                await self.recover_state_or_init()
+                await self.main_loop()
+            except Exception as err:
+                logger.error(f"❌ Критическая ошибка: {err}")
+                await self.safe_close_exchange()
+                await asyncio.sleep(5)
+
+bot = CCXTUsdcHedgeBot()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
-    task = loop.create_task(bot.start())
+    task = loop.create_task(bot.run())
     yield
     bot.is_running = False
     task.cancel()
-    if bot.session:
-        await bot.session.close()
+    if bot.exchange:
+        await bot.exchange.close()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 @app.get("/health")
 async def root():
-    return {
-        "status": "ok",
-        "symbol": bot.active_symbol,
-        "latest_price": bot.latest_price,
-        "strategy": bot.strategy
-    }
+    return {"status": "ok", "symbol": SYMBOL_DISPLAY}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
