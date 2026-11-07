@@ -22,7 +22,6 @@ BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))  # Стартов�
 GRID_LEVELS = 3                 # 3 уровня усреднения
 VISIBLE_GRID_LEVELS = 1         # По одной лимитке усреднения в стакане
 
-# Точные отступы сетки: -5%, -10%, -15% от ТВХ
 def get_grid_step_percent(step: int) -> float:
     if step == 1:
         return 5.0
@@ -32,7 +31,6 @@ def get_grid_step_percent(step: int) -> float:
         return 15.0
     return 15.0
 
-# Объемы по уровням с мультипликаторами x1, x2, x4
 def get_step_usdc_volume(step: int) -> float:
     if step <= 1:
         return float(BASE_ORDER_USDC)
@@ -91,6 +89,9 @@ class CCXTUsdcHedgeBot:
         self.active_limit_orders = {}
         self.long_tp_order_id = None
         self.short_tp_order_id = None
+
+        self.last_long_tp_time = 0.0
+        self.last_short_tp_time = 0.0
 
         self.exec_lock = asyncio.Lock()
 
@@ -197,27 +198,28 @@ class CCXTUsdcHedgeBot:
         return 0.0, 0.0
 
     async def fetch_trade_and_pnl_details(self):
+        """Собирает реальный PnL, комиссии и баланс через fetch_my_trades и fetch_balance"""
         for attempt in range(5):
             await asyncio.sleep(1.0)
             try:
-                income_history = await self.exchange.fetch_income(SYMBOL, limit=15)
+                trades = await self.exchange.fetch_my_trades(SYMBOL, limit=10)
                 realized_pnl = 0.0
                 fee_paid = 0.0
 
-                for item in reversed(income_history):
-                    income_type = item.get('type')
-                    amount = float(item.get('amount', 0.0))
+                for trade in reversed(trades):
+                    info = trade.get('info', {})
+                    # Извлекаем реализованный PnL и комиссию из полей Binance Futures ордера
+                    pnl = float(info.get('realizedPnl', 0.0))
+                    fee_cost = float(trade.get('fee', {}).get('cost', 0.0))
 
-                    if income_type == 'REALIZED_PNL':
-                        realized_pnl += amount
-                    elif income_type == 'COMMISSION':
-                        fee_paid += abs(amount)
-
-                    if income_type == 'REALIZED_PNL':
+                    if pnl != 0.0 or fee_cost != 0.0:
+                        realized_pnl += pnl
+                        fee_paid += abs(fee_cost)
+                        # Берем только последние закрывающие сделки текущего цикла
                         break
 
                 net_profit = realized_pnl - fee_paid
-                
+
                 balance_data = await self.exchange.fetch_balance()
                 usdc_free = balance_data.get('USDC', {}).get('free', 0.0)
                 usdc_total = balance_data.get('USDC', {}).get('total', 0.0)
@@ -278,7 +280,6 @@ class CCXTUsdcHedgeBot:
                             params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
                         )
                         self.long_tp_order_id = str(new_ord['id'])
-                        logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан TP_LONG по ${tp_price:,.2f}")
                     except Exception as e:
                         logger.error(f"❌ Ошибка создания TP_LONG: {e}")
 
@@ -297,7 +298,6 @@ class CCXTUsdcHedgeBot:
                             params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
                         )
                         self.short_tp_order_id = str(new_ord['id'])
-                        logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан TP_SHORT по ${tp_price:,.2f}")
                     except Exception as e:
                         logger.error(f"❌ Ошибка создания TP_SHORT: {e}")
 
@@ -320,7 +320,6 @@ class CCXTUsdcHedgeBot:
                                 params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
                             )
                             self.active_limit_orders[f"LONG_{next_step}"] = str(new_ord['id'])
-                            logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан лимитник усреднения LONG #{next_step} по ${grid_price:,.2f}")
                         except Exception as e:
                             logger.error(f"❌ Ошибка создания лимитника LONG: {e}")
 
@@ -343,7 +342,6 @@ class CCXTUsdcHedgeBot:
                                 params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
                             )
                             self.active_limit_orders[f"SHORT_{next_step}"] = str(new_ord['id'])
-                            logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан лимитник усреднения SHORT #{next_step} по ${grid_price:,.2f}")
                         except Exception as e:
                             logger.error(f"❌ Ошибка создания лимитника SHORT: {e}")
 
@@ -352,7 +350,7 @@ class CCXTUsdcHedgeBot:
 
     async def recover_state_or_init(self):
         async with self.exec_lock:
-            logger.info(f"🔄 Сканирование биржи и подхват существующих позиций для {SYMBOL_DISPLAY}...")
+            logger.info(f"🔄 Сканирование биржи и подхват позиций для {SYMBOL_DISPLAY}...")
 
             positions = []
             for attempt in range(3):
@@ -375,13 +373,8 @@ class CCXTUsdcHedgeBot:
                 self.long_entry_price = float(long_pos['entryPrice'])
                 self.initial_long_entry = self.long_entry_price
                 self.long_contracts_prev = long_contracts
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG успешно подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
-                await send_tg_message(
-                    self.http_session,
-                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.long_entry_price:,.2f} | Объем: {long_contracts}"
-                )
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
             else:
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден! Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
                 l_entry, l_contracts = await self.get_actual_position_entry_price('LONG')
@@ -389,10 +382,6 @@ class CCXTUsdcHedgeBot:
                 self.initial_long_entry = self.long_entry_price
                 self.long_contracts_prev = l_contracts if l_contracts > 0 else base_qty
                 self.long_loser_step = 0
-                await send_tg_message(
-                    self.http_session,
-                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}"
-                )
 
             # --- SHORT ---
             if short_pos:
@@ -400,13 +389,8 @@ class CCXTUsdcHedgeBot:
                 self.short_entry_price = float(short_pos['entryPrice'])
                 self.initial_short_entry = self.short_entry_price
                 self.short_contracts_prev = short_contracts
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT успешно подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
-                await send_tg_message(
-                    self.http_session,
-                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.short_entry_price:,.2f} | Объем: {short_contracts}"
-                )
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
             else:
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден! Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
                 s_entry, s_contracts = await self.get_actual_position_entry_price('SHORT')
@@ -414,20 +398,14 @@ class CCXTUsdcHedgeBot:
                 self.initial_short_entry = self.short_entry_price
                 self.short_contracts_prev = s_contracts if s_contracts > 0 else base_qty
                 self.short_loser_step = 0
-                await send_tg_message(
-                    self.http_session,
-                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}"
-                )
 
             await self.audit_and_sync_all_orders()
 
     async def reopen_winner_position(self, current_price, winner_side):
         async with self.exec_lock:
-            icon = "🟢" if winner_side == 'LONG' else "🔻"
-            direction_text = "BUY" if winner_side == 'LONG' else "SELL"
-            
             triggered_step = self.long_loser_step if winner_side == 'LONG' else self.short_loser_step
             step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
+            direction_text = "BUY" if winner_side == 'LONG' else "SELL"
 
             logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
 
@@ -478,7 +456,7 @@ class CCXTUsdcHedgeBot:
                 )
                 await send_tg_message(self.http_session, tg_msg)
             else:
-                logger.error(f"❌ Критическая ошибка: не удалось переоткрыть позицию {winner_side} после 3 попыток!")
+                logger.error(f"❌ Не удалось переоткрыть позицию {winner_side} после 3 попыток!")
 
             await self.audit_and_sync_all_orders()
 
@@ -486,6 +464,7 @@ class CCXTUsdcHedgeBot:
         logger.info(f"✅ Главный цикл мониторинга для {SYMBOL_DISPLAY} запущен.")
         while self.is_running:
             try:
+                current_time = time.time()
                 open_orders = await self.exchange.fetch_open_orders(SYMBOL)
                 positions = await self.exchange.fetch_positions([SYMBOL])
 
@@ -495,11 +474,12 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. Проверка срабатывания ТЕЙК-ПРОФИТА LONG (если контракты резко уменьшились) ---
+                # --- 1. ТЕЙК-ПРОФИТ LONG (с защитой от дублей по тайм-ауту 5 сек) ---
                 if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
                     drop_diff = self.long_contracts_prev - long_contracts
-                    if drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0:
-                        logger.info("Обнаружено закрытие/исполнение тейка по LONG!")
+                    if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
+                        self.last_long_tp_time = current_time
+                        logger.info("Обнаружено исполнение тейка по LONG!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -511,11 +491,12 @@ class CCXTUsdcHedgeBot:
                         await asyncio.sleep(1)
                         continue
 
-                # --- 2. Проверка срабатывания ТЕЙК-ПРОФИТА SHORT ---
+                # --- 2. ТЕЙК-ПРОФИТ SHORT (с защитой от дублей по тайм-ауту 5 сек) ---
                 if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
                     drop_diff = self.short_contracts_prev - short_contracts
-                    if drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0:
-                        logger.info("Обнаружено закрытие/исполнение тейка по SHORT!")
+                    if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
+                        self.last_short_tp_time = current_time
+                        logger.info("Обнаружено исполнение тейка по SHORT!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
@@ -527,7 +508,7 @@ class CCXTUsdcHedgeBot:
                         await asyncio.sleep(1)
                         continue
 
-                # --- 3. Проверка срабатывания усреднения LONG (контракты выросли) ---
+                # --- 3. Усреднение LONG ---
                 if long_contracts > self.long_contracts_prev and self.long_contracts_prev > 0:
                     async with self.exec_lock:
                         self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
@@ -541,7 +522,7 @@ class CCXTUsdcHedgeBot:
                         await self.audit_and_sync_all_orders()
                         continue
 
-                # --- 4. Проверка срабатывания усреднения SHORT (контракты выросли) ---
+                # --- 4. Усреднение SHORT ---
                 if short_contracts > self.short_contracts_prev and self.short_contracts_prev > 0:
                     async with self.exec_lock:
                         self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
