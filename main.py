@@ -14,7 +14,6 @@ from fastapi import FastAPI
 
 SYMBOL_RAW = os.getenv('SYMBOL', 'ZEC/USDC:USDC').strip()
 SYMBOL = SYMBOL_RAW
-# Чистое имя для красивых сообщений в телеграм (например, BTC/USDC)
 SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 
 LEVERAGE = int(os.getenv('LEVERAGE', 50))
@@ -436,21 +435,31 @@ class CCXTUsdcHedgeBot:
             qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
 
-            try:
-                await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
-                actual_entry, actual_contracts = await self.get_actual_position_entry_price(winner_side)
-                
-                if actual_entry > 0:
-                    if winner_side == 'LONG':
-                        self.long_entry_price = actual_entry
-                        self.initial_long_entry = actual_entry
-                        self.long_contracts_prev = actual_contracts
-                        self.long_loser_step = 0
-                    else:
-                        self.short_entry_price = actual_entry
-                        self.initial_short_entry = actual_entry
-                        self.short_contracts_prev = actual_contracts
-                        self.short_loser_step = 0
+            actual_entry = 0.0
+            actual_contracts = 0.0
+
+            # Повторные попытки с защитой от сетевых сбоев
+            for attempt in range(3):
+                try:
+                    await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
+                    actual_entry, actual_contracts = await self.get_actual_position_entry_price(winner_side)
+                    if actual_entry > 0:
+                        break
+                except Exception as e:
+                    logger.warning(f"⚠️ Попытка {attempt+1} переоткрытия {winner_side} не удалась: {e}")
+                    await asyncio.sleep(1.5)
+
+            if actual_entry > 0:
+                if winner_side == 'LONG':
+                    self.long_entry_price = actual_entry
+                    self.initial_long_entry = actual_entry
+                    self.long_contracts_prev = actual_contracts
+                    self.long_loser_step = 0
+                else:
+                    self.short_entry_price = actual_entry
+                    self.initial_short_entry = actual_entry
+                    self.short_contracts_prev = actual_contracts
+                    self.short_loser_step = 0
 
                 details = await self.fetch_trade_and_pnl_details()
                 net_pnl = details['net']
@@ -470,8 +479,8 @@ class CCXTUsdcHedgeBot:
                     f"🔄 <b>Новый вход:</b> ${actual_entry:,.2f} | Объем: {actual_contracts}"
                 )
                 await send_tg_message(self.http_session, tg_msg)
-            except Exception as e:
-                logger.error(f"❌ Ошибка переоткрытия {winner_side}: {e}")
+            else:
+                logger.error(f"❌ Критическая ошибка: не удалось переоткрыть позицию {winner_side} после 3 попыток!")
 
             await self.audit_and_sync_all_orders()
 
