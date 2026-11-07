@@ -384,7 +384,7 @@ class HedgeBot:
             raise RuntimeError(f"Invalid TP quantity for {side}: {amount}")
         created = await self.create_order(
             "limit", order_side, amount, target,
-            {"positionSide": side, "timeInForce": "GTC", "reduceOnly": False}
+            {"positionSide": side, "timeInForce": "GTC"}
         )
         s["tp_order_id"] = str(created["id"])
         s["tp_created_at"] = time.time()
@@ -469,6 +469,12 @@ class HedgeBot:
                 elif self.state[key].get("pending_reopen") and DRY_RUN:
                     log.warning("DRY_RUN: pending reopen for %s; no simulated position engine is enabled.", side)
                 else:
+                    # Position was closed outside the tracked TP flow. Do not leave
+                    # resting TP/GRID orders that could create unintended exposure.
+                    for stale_id in (self.state[key].get("tp_order_id"),
+                                     self.state[key].get("grid_order_id")):
+                        if stale_id:
+                            await self.cancel_order(stale_id)
                     self.state[key] = self._empty_side()
         self._save_state()
 
@@ -564,6 +570,13 @@ class HedgeBot:
             amount = float(order.get("amount") or 0)
             if status == "closed" or (amount > 0 and filled >= amount * 0.999):
                 await self.report_tp(side, str(order_id), amount)
+                # A full TP can flatten this hedge side. Cancel its resting GRID order
+                # before any automatic reopen, otherwise that stale order could add
+                # exposure to the newly opened cycle later.
+                grid_order_id = s.get("grid_order_id")
+                if grid_order_id:
+                    await self.cancel_order(grid_order_id)
+                    s["grid_order_id"] = None
                 s["tp_order_id"] = None
                 s["pending_reopen"] = True
                 # Reopen only after the exchange confirms that the old side is flat.
@@ -670,6 +683,75 @@ async def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
