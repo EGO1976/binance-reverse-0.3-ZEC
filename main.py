@@ -198,18 +198,23 @@ class CCXTUsdcHedgeBot:
         return 0.0, 0.0
 
     async def fetch_trade_and_pnl_details(self):
-        """Собирает реальный PnL, комиссии и баланс через fetch_my_trades и fetch_balance"""
+        """Собирает реальный PnL, комиссии и баланс через fetch_closed_orders и fetch_balance"""
         for attempt in range(5):
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
             try:
-                trades = await self.exchange.fetch_my_trades(SYMBOL, limit=10)
+                closed_orders = await self.exchange.fetch_closed_orders(SYMBOL, limit=5)
                 realized_pnl = 0.0
                 fee_paid = 0.0
 
-                for trade in reversed(trades):
-                    info = trade.get('info', {})
+                for order in reversed(closed_orders):
+                    info = order.get('info', {})
                     pnl = float(info.get('realizedPnl', 0.0))
-                    fee_cost = float(trade.get('fee', {}).get('cost', 0.0))
+                    
+                    fee_cost = 0.0
+                    for fee_item in order.get('fees', []):
+                        fee_cost += float(fee_item.get('cost', 0.0))
+                    if fee_cost == 0.0:
+                        fee_cost = float(info.get('cumCommission', 0.0))
 
                     if pnl != 0.0 or fee_cost != 0.0:
                         realized_pnl += pnl
@@ -263,7 +268,7 @@ class CCXTUsdcHedgeBot:
             self.long_tp_order_id = None
             self.short_tp_order_id = None
 
-            # --- 1. LONG TP ---
+            # --- 1. LONG TP (Лимитный ордер) ---
             if long_pos:
                 l_contracts = float(long_pos['contracts'])
                 if existing_tp_long:
@@ -275,13 +280,13 @@ class CCXTUsdcHedgeBot:
                     try:
                         new_ord = await self.exchange.create_order(
                             SYMBOL, 'LIMIT', 'sell', tp_qty, tp_price,
-                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
+                            params={'positionSide': 'LONG', 'timeInForce': 'GTC', 'reduceOnly': True}
                         )
                         self.long_tp_order_id = str(new_ord['id'])
                     except Exception as e:
                         logger.error(f"❌ Ошибка создания TP_LONG: {e}")
 
-            # --- 2. SHORT TP ---
+            # --- 2. SHORT TP (Лимитный ордер) ---
             if short_pos:
                 s_contracts = float(short_pos['contracts'])
                 if existing_tp_short:
@@ -293,7 +298,7 @@ class CCXTUsdcHedgeBot:
                     try:
                         new_ord = await self.exchange.create_order(
                             SYMBOL, 'LIMIT', 'buy', tp_qty, tp_price,
-                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
+                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC', 'reduceOnly': True}
                         )
                         self.short_tp_order_id = str(new_ord['id'])
                     except Exception as e:
@@ -423,7 +428,7 @@ class CCXTUsdcHedgeBot:
             step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
             direction_text = "BUY" if winner_side == 'LONG' else "SELL"
 
-            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Лимитный Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
 
             qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
@@ -462,7 +467,7 @@ class CCXTUsdcHedgeBot:
                 pnl_percent = (net_pnl / BASE_ORDER_USDC) * 100.0 if BASE_ORDER_USDC > 0 else 0.0
 
                 tg_msg = (
-                    f"✅ <b>ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                    f"✅ <b>ЛИМИТНЫЙ ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
                     f"Направление: {direction_text}\n"
                     f"💰 PnL: <b>{net_pnl:+.2f} USDC ({pnl_percent:+.2f}%)</b>\n"
                     f"📈 Выход: {current_price:,.2f} | Gross: {gross_pnl:+.2f} USDC\n"
@@ -490,12 +495,12 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. ТЕЙК-ПРОФИТ LONG ---
+                # --- 1. ЛИМИТНЫЙ ТЕЙК-ПРОФИТ LONG ---
                 if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
                     drop_diff = self.long_contracts_prev - long_contracts
                     if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
                         self.last_long_tp_time = current_time
-                        logger.info("Обнаружено исполнение тейка по LONG!")
+                        logger.info("Исполнен лимитный тейк-профит по LONG!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -507,12 +512,12 @@ class CCXTUsdcHedgeBot:
                         await asyncio.sleep(1)
                         continue
 
-                # --- 2. ТЕЙК-ПРОФИТ SHORT ---
+                # --- 2. ЛИМИТНЫЙ ТЕЙК-ПРОФИТ SHORT ---
                 if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
                     drop_diff = self.short_contracts_prev - short_contracts
                     if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
                         self.last_short_tp_time = current_time
-                        logger.info("Обнаружено исполнение тейка по SHORT!")
+                        logger.info("Исполнен лимитный тейк-профит по SHORT!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
