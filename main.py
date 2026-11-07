@@ -265,47 +265,47 @@ class CCXTUsdcHedgeBot:
                     existing_grid_short[o_id] = o
 
             self.active_limit_orders.clear()
-            self.long_tp_order_id = None
-            self.short_tp_order_id = None
 
-            # --- 1. LONG TP (Лимитный ордер) ---
-            if long_pos:
+            # --- 1. LONG TP ---
+            if long_pos and float(long_pos['contracts']) > 0:
                 l_contracts = float(long_pos['contracts'])
                 if existing_tp_long:
                     self.long_tp_order_id = str(existing_tp_long['id'])
-                else:
+                elif not self.long_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
                     l_entry = float(long_pos['entryPrice'])
                     tp_price = self.round_price(l_entry * (1.0 + (WINNER_TAKE_PROFIT_PCT / 100.0)))
                     tp_qty = self.round_amount(l_contracts)
                     try:
                         new_ord = await self.exchange.create_order(
                             SYMBOL, 'LIMIT', 'sell', tp_qty, tp_price,
-                            params={'positionSide': 'LONG', 'timeInForce': 'GTC', 'reduceOnly': True}
+                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
                         )
                         self.long_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан TP_LONG по ${tp_price:,.2f}")
                     except Exception as e:
                         logger.error(f"❌ Ошибка создания TP_LONG: {e}")
 
-            # --- 2. SHORT TP (Лимитный ордер) ---
-            if short_pos:
+            # --- 2. SHORT TP ---
+            if short_pos and float(short_pos['contracts']) > 0:
                 s_contracts = float(short_pos['contracts'])
                 if existing_tp_short:
                     self.short_tp_order_id = str(existing_tp_short['id'])
-                else:
+                elif not self.short_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
                     s_entry = float(short_pos['entryPrice'])
                     tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
                     tp_qty = self.round_amount(s_contracts)
                     try:
                         new_ord = await self.exchange.create_order(
                             SYMBOL, 'LIMIT', 'buy', tp_qty, tp_price,
-                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC', 'reduceOnly': True}
+                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
                         )
                         self.short_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан TP_SHORT по ${tp_price:,.2f}")
                     except Exception as e:
                         logger.error(f"❌ Ошибка создания TP_SHORT: {e}")
 
             # --- 3. LONG Grid ---
-            if long_pos and self.initial_long_entry > 0:
+            if long_pos and float(long_pos['contracts']) > 0 and self.initial_long_entry > 0:
                 if existing_grid_long:
                     grid_id, grid_obj = list(existing_grid_long.items())[0]
                     next_step = self.long_loser_step + 1
@@ -327,7 +327,7 @@ class CCXTUsdcHedgeBot:
                             logger.error(f"❌ Ошибка создания лимитника LONG: {e}")
 
             # --- 4. SHORT Grid ---
-            if short_pos and self.initial_short_entry > 0:
+            if short_pos and float(short_pos['contracts']) > 0 and self.initial_short_entry > 0:
                 if existing_grid_short:
                     grid_id, grid_obj = list(existing_grid_short.items())[0]
                     next_step = self.short_loser_step + 1
@@ -428,13 +428,19 @@ class CCXTUsdcHedgeBot:
             step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
             direction_text = "BUY" if winner_side == 'LONG' else "SELL"
 
-            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Лимитный Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
 
             qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
 
             actual_entry = 0.0
             actual_contracts = 0.0
+
+            # Сбрасываем ID старого тейка перед переоткрытием
+            if winner_side == 'LONG':
+                self.long_tp_order_id = None
+            else:
+                self.short_tp_order_id = None
 
             for attempt in range(3):
                 try:
@@ -467,7 +473,7 @@ class CCXTUsdcHedgeBot:
                 pnl_percent = (net_pnl / BASE_ORDER_USDC) * 100.0 if BASE_ORDER_USDC > 0 else 0.0
 
                 tg_msg = (
-                    f"✅ <b>ЛИМИТНЫЙ ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                    f"✅ <b>ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
                     f"Направление: {direction_text}\n"
                     f"💰 PnL: <b>{net_pnl:+.2f} USDC ({pnl_percent:+.2f}%)</b>\n"
                     f"📈 Выход: {current_price:,.2f} | Gross: {gross_pnl:+.2f} USDC\n"
@@ -495,12 +501,12 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. ЛИМИТНЫЙ ТЕЙК-ПРОФИТ LONG ---
+                # --- 1. ТЕЙК-ПРОФИТ LONG ---
                 if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
                     drop_diff = self.long_contracts_prev - long_contracts
                     if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
                         self.last_long_tp_time = current_time
-                        logger.info("Исполнен лимитный тейк-профит по LONG!")
+                        logger.info("Исполнен тейк-профит по LONG!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -512,12 +518,12 @@ class CCXTUsdcHedgeBot:
                         await asyncio.sleep(1)
                         continue
 
-                # --- 2. ЛИМИТНЫЙ ТЕЙК-ПРОФИТ SHORT ---
+                # --- 2. ТЕЙК-ПРОФИТ SHORT ---
                 if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
                     drop_diff = self.short_contracts_prev - short_contracts
                     if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
                         self.last_short_tp_time = current_time
-                        logger.info("Исполнен лимитный тейк-профит по SHORT!")
+                        logger.info("Исполнен тейк-профит по SHORT!")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
