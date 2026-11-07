@@ -1,690 +1,613 @@
+
 import asyncio
-import json
-import logging
-import math
 import os
 import time
-from pathlib import Path
-from contextlib import asynccontextmanager
-from typing import Any, Optional
-
+import math
 import aiohttp
 import ccxt.async_support as ccxt
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-# =============================================================================
-# Binance USD-M / USDC Hedge Mode bot
-#
-# IMPORTANT:
-# - Test on Binance demo/testnet first.
-# - Use API key permissions without withdrawals.
-# - Existing position recovery is fail-safe: if state file is missing, the bot
-#   adopts the exchange position but suspends GRID placement because its original
-#   anchor/filled grid level cannot be reconstructed reliably from average entry.
-# - PnL and fees are read from actual user trades for the specific TP order.
-# =============================================================================
+# ==============================================================================
+# 🎛️ ПАНЕЛЬ УПРАВЛЕНИЯ ПАРАМЕТРАМИ БОТА (HEDGE MODE / USDC)
+# ==============================================================================
 
-SYMBOL = os.getenv("SYMBOL", "ZEC/USDC:USDC").strip()
-SYMBOL_DISPLAY = SYMBOL.split(":")[0]
-LEVERAGE = int(os.getenv("LEVERAGE", "50"))
-BASE_ORDER_USDC = float(os.getenv("LONG_USDT_AMOUNT", "100"))
-GRID_LEVELS = int(os.getenv("GRID_LEVELS", "3"))
-VISIBLE_GRID_LEVELS = 1
-WINNER_TAKE_PROFIT_PCT = float(os.getenv("TP_PCT", "0.5"))
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1.0"))
-STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SYMBOL_RAW = os.getenv('SYMBOL', 'BTC/USDC:USDC').strip()
+SYMBOL = SYMBOL_RAW
+SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("USDC_HEDGE_BOT")
+LEVERAGE = int(os.getenv('LEVERAGE', 50))
+BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))  # Стартовый объем в USDC для каждой ветки
 
+GRID_LEVELS = 3                 # 3 уровня усреднения
+VISIBLE_GRID_LEVELS = 1         # По одной лимитке усреднения в стакане
 
-def grid_step_percent(step: int) -> float:
-    return {1: 5.0, 2: 10.0, 3: 15.0}.get(step, 15.0)
+def get_grid_step_percent(step: int) -> float:
+    if step == 1:
+        return 5.0
+    elif step == 2:
+        return 10.0
+    elif step == 3:
+        return 15.0
+    return 15.0
 
+def get_step_usdc_volume(step: int) -> float:
+    if step <= 1:
+        return float(BASE_ORDER_USDC)
+    elif step == 2:
+        return float(BASE_ORDER_USDC * 2.0)
+    elif step == 3:
+        return float(BASE_ORDER_USDC * 4.0)
+    return float(BASE_ORDER_USDC * 4.0)
 
-def grid_step_usdc(step: int) -> float:
-    return BASE_ORDER_USDC * {1: 1.0, 2: 2.0, 3: 4.0}.get(step, 4.0)
+WINNER_TAKE_PROFIT_PCT = 0.5    # Жестко 0.5% TP для всех уровней
 
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
-async def telegram(session: Optional[aiohttp.ClientSession], message: str) -> None:
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+logger = logging.getLogger("CCXT_USDC_HEDGE_BOT")
+
+async def send_tg_message(session: aiohttp.ClientSession, text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or session is None or session.closed:
-        log.info("TG: %s", message.replace("\n", " | "))
+        print(f"💬 [TG Log]: {text}")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': text,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True
+    }
     try:
-        async with session.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as response:
-            if response.status >= 300:
-                log.warning("Telegram HTTP %s: %s", response.status, await response.text())
-    except Exception:
-        log.exception("Telegram send failed")
+        async with session.post(url, json=payload, timeout=5) as resp:
+            pass
+    except Exception as e:
+        print(f"❌ Ошибка Telegram: {e}")
 
-
-class HedgeBot:
+class CCXTUsdcHedgeBot:
     def __init__(self):
         self.exchange = None
-        self.session = None
-        self.market = None
-        self.lock = asyncio.Lock()
-        self.running = True
+        self.market_info = None
+        self.http_session = None
+        self.is_running = True
 
-        self.state = {
-            "version": 2,
-            "symbol": SYMBOL,
-            "long": self._empty_side(),
-            "short": self._empty_side(),
-            "last_processed_trade_ids": {"LONG": [], "SHORT": []},
-        }
-        self.last_reconcile = 0.0
+        self.long_entry_price = 0.0
+        self.short_entry_price = 0.0
 
-    @staticmethod
-    def _empty_side():
-        return {
-            "initial_entry": 0.0,
-            "entry_price": 0.0,
-            "contracts": 0.0,
-            "grid_step": 0,
-            "tp_order_id": None,
-            "grid_order_id": None,
-            "recovery_uncertain": False,
-            "tp_created_at": 0.0,
-            "pending_reopen": False,
-        }
+        self.initial_long_entry = 0.0
+        self.initial_short_entry = 0.0
 
-    def _load_state(self):
-        if not STATE_FILE.exists():
-            log.warning("State file %s not found; existing positions will be adopted conservatively.", STATE_FILE)
-            return False
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if data.get("symbol") != SYMBOL:
-                log.warning("State symbol differs (%s vs %s); ignoring old state.", data.get("symbol"), SYMBOL)
-                return False
-            for side in ("long", "short"):
-                if isinstance(data.get(side), dict):
-                    self.state[side].update(data[side])
-            self.state["last_processed_trade_ids"] = data.get(
-                "last_processed_trade_ids", self.state["last_processed_trade_ids"]
-            )
-            log.info("State restored from %s", STATE_FILE)
-            return True
-        except Exception:
-            log.exception("Could not read state file; starting with conservative recovery.")
-            return False
+        self.long_contracts_prev = 0.0
+        self.short_contracts_prev = 0.0
 
-    def _save_state(self):
-        tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
-        try:
-            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(STATE_FILE)
-        except Exception:
-            log.exception("Could not persist bot state")
+        self.long_loser_step = 0
+        self.short_loser_step = 0
 
-    def _new_exchange(self):
-        key = os.getenv("BINANCE_API_KEY", "").strip().strip("'").strip('"')
-        secret = os.getenv("BINANCE_SECRET_KEY", "").strip().strip("'").strip('"')
-        if not key or not secret:
-            raise RuntimeError("BINANCE_API_KEY / BINANCE_SECRET_KEY are not configured")
+        self.active_limit_orders = {}
+        self.long_tp_order_id = None
+        self.short_tp_order_id = None
+
+        self.last_long_tp_time = 0.0
+        self.last_short_tp_time = 0.0
+
+        self.exec_lock = asyncio.Lock()
+
+    def init_exchange(self):
+        raw_key = os.getenv('BINANCE_API_KEY', '').strip().strip("'").strip('"')
+        raw_secret = os.getenv('BINANCE_SECRET_KEY', '').strip().strip('"').strip("'")
+
         return ccxt.binanceusdm({
-            "apiKey": key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 15000,
-            "options": {"defaultType": "future", "adjustForTimeDifference": True},
+            'apiKey': raw_key,
+            'secret': raw_secret,
+            'enableRateLimit': True,
+            'rateLimit': 300,
+            'timeout': 10000,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True
+            }
         })
+
+    async def safe_close_exchange(self):
+        if self.exchange:
+            try:
+                await self.exchange.close()
+            except Exception:
+                pass
+            self.exchange = None
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
 
     async def initialize(self):
         if self.exchange is None:
-            self.exchange = self._new_exchange()
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-        await self.exchange.load_markets()
-        if SYMBOL not in self.exchange.markets:
-            raise RuntimeError(f"Symbol {SYMBOL} not found in loaded CCXT markets")
-        self.market = self.exchange.market(SYMBOL)
+            self.exchange = self.init_exchange()
+        if self.http_session is None or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession()
 
-        # Validate that the market is a linear contract settled in USDC.
-        settle = self.market.get("settle")
-        if settle and settle != "USDC":
-            raise RuntimeError(f"{SYMBOL} settles in {settle}, not USDC")
-        if not self.market.get("contract"):
-            raise RuntimeError(f"{SYMBOL} is not recognized as a contract market")
+        if self.market_info is None:
+            markets = await self.exchange.load_markets()
+            if SYMBOL in markets:
+                self.market_info = markets[SYMBOL]
+            else:
+                raise KeyError(f"Символ {SYMBOL} не найден на бирже.")
 
-        if not DRY_RUN:
+        try:
             await self.exchange.set_leverage(LEVERAGE, SYMBOL)
             try:
-                await self.exchange.set_margin_mode("cross", SYMBOL)
-            except Exception as exc:
-                # Binance may report that the requested mode is already active.
-                log.info("Margin mode unchanged/not set: %s", exc)
-            try:
-                await self.exchange.set_position_mode(True, SYMBOL)
-            except Exception as exc:
-                log.info("Position mode unchanged/not set: %s", exc)
-
-        log.info("Initialized %s | leverage=%sx | contractSize=%s | dry_run=%s",
-                 SYMBOL, LEVERAGE, self.market.get("contractSize"), DRY_RUN)
-
-    async def close(self):
-        if self.exchange is not None:
-            await self.exchange.close()
-            self.exchange = None
-        if self.session is not None and not self.session.closed:
-            await self.session.close()
-
-    def amount_precision(self, amount: float) -> float:
-        return float(self.exchange.amount_to_precision(SYMBOL, amount))
-
-    def price_precision(self, price: float) -> float:
-        return float(self.exchange.price_to_precision(SYMBOL, price))
-
-    def qty_for_notional(self, notional_usdc: float, price: float) -> float:
-        if price <= 0:
-            raise ValueError("Price must be positive")
-        contract_size = float(self.market.get("contractSize") or 1.0)
-        # CCXT contract amount is number of contracts, not necessarily base units.
-        qty = self.amount_precision(notional_usdc / (price * contract_size))
-        min_amount = ((self.market.get("limits") or {}).get("amount") or {}).get("min")
-        min_cost = ((self.market.get("limits") or {}).get("cost") or {}).get("min")
-        if min_amount is not None and qty < float(min_amount):
-            raise ValueError(f"Calculated quantity {qty} is below min amount {min_amount}")
-        estimated_cost = qty * contract_size * price
-        if min_cost is not None and estimated_cost < float(min_cost):
-            raise ValueError(f"Calculated notional {estimated_cost} is below min cost {min_cost}")
-        if qty <= 0:
-            raise ValueError("Calculated quantity is zero after precision")
-        return qty
-
-    @staticmethod
-    def _position_side(position: dict) -> Optional[str]:
-        info = position.get("info") or {}
-        raw = str(info.get("positionSide") or "").upper()
-        if raw in ("LONG", "SHORT"):
-            return raw
-        side = str(position.get("side") or "").lower()
-        if side == "long":
-            return "LONG"
-        if side == "short":
-            return "SHORT"
-        return None
-
-    async def fetch_positions(self):
-        positions = await self.exchange.fetch_positions([SYMBOL])
-        result = {"LONG": None, "SHORT": None}
-        for p in positions:
-            side = self._position_side(p)
-            contracts = abs(float(p.get("contracts") or 0))
-            if side in result and contracts > 0:
-                result[side] = p
-        return result
-
-    async def fetch_open_orders_by_side(self):
-        orders = await self.exchange.fetch_open_orders(SYMBOL)
-        result = {"LONG_TP": [], "SHORT_TP": [], "LONG_GRID": [], "SHORT_GRID": []}
-        for order in orders:
-            info = order.get("info") or {}
-            pos_side = str(info.get("positionSide") or "").upper()
-            side = str(order.get("side") or "").lower()
-            reduce_only = order.get("reduceOnly")
-            if reduce_only is None:
-                reduce_only = str(info.get("reduceOnly", "false")).lower() == "true"
-            # Hedge-mode Binance TP closes LONG with SELL, SHORT with BUY.
-            if pos_side == "LONG" and side == "sell":
-                result["LONG_TP" if reduce_only or order.get("type") == "limit" else "LONG_TP"].append(order)
-            elif pos_side == "SHORT" and side == "buy":
-                result["SHORT_TP"].append(order)
-            elif pos_side == "LONG" and side == "buy":
-                result["LONG_GRID"].append(order)
-            elif pos_side == "SHORT" and side == "sell":
-                result["SHORT_GRID"].append(order)
-        return result
-
-    async def create_order(self, order_type, side, amount, price=None, params=None):
-        if DRY_RUN:
-            log.warning("DRY_RUN: would create %s %s amount=%s price=%s params=%s",
-                        order_type, side, amount, price, params)
-            return {"id": f"dry-{time.time_ns()}", "status": "open", "amount": amount, "price": price}
-        return await self.exchange.create_order(SYMBOL, order_type, side, amount, price, params or {})
-
-    async def cancel_order(self, order_id):
-        if DRY_RUN:
-            log.warning("DRY_RUN: would cancel order %s", order_id)
-            return
-        try:
-            await self.exchange.cancel_order(str(order_id), SYMBOL)
-        except ccxt.OrderNotFound:
+                await self.exchange.set_margin_mode('CROSSED', SYMBOL)
+            except Exception:
+                pass
+            await self.exchange.set_position_mode(hedged=True, symbol=SYMBOL)
+        except Exception:
             pass
 
-    async def open_base_position(self, side: str, price: float):
-        key = side.lower()
-        order_side = "buy" if side == "LONG" else "sell"
-        qty = self.qty_for_notional(BASE_ORDER_USDC, price)
-        order = await self.create_order(
-            "market", order_side, qty, None, {"positionSide": side}
-        )
-        if DRY_RUN:
-            entry = price
-            contracts = qty
-        else:
-            # Wait briefly for Binance position endpoint to reflect the fill.
-            entry, contracts = 0.0, 0.0
-            for _ in range(8):
-                await asyncio.sleep(0.4)
-                positions = await self.fetch_positions()
-                p = positions[side]
-                if p and float(p.get("contracts") or 0) > 0:
-                    entry = float(p.get("entryPrice") or 0)
-                    contracts = abs(float(p.get("contracts") or 0))
-                    if entry > 0 and contracts > 0:
-                        break
-            if entry <= 0 or contracts <= 0:
-                raise RuntimeError(f"{side} market order {order.get('id')} submitted, but position fill was not confirmed")
-        self.state[key] = self._empty_side()
-        self.state[key].update({
-            "initial_entry": entry,
-            "entry_price": entry,
-            "contracts": contracts,
-            "grid_step": 0,
-            "recovery_uncertain": False,
-        })
-        self._save_state()
-        await telegram(self.session,
-                       f"🟢 <b>{SYMBOL_DISPLAY}: открыта базовая {side}</b>\\n"
-                       f"Цена: {entry:.8f}\\nКонтракты: {contracts:.8f}")
-        return order
+        logger.info(f"✅ Инициализация выполнена для {SYMBOL_DISPLAY}. Плечо {LEVERAGE}x CROSSED (Hedge Mode, USDC).")
 
-    async def adopt_positions(self, state_file_was_loaded: bool):
-        positions = await self.fetch_positions()
-        for side in ("LONG", "SHORT"):
-            p = positions[side]
-            key = side.lower()
-            s = self.state[key]
-            if p:
-                contracts = abs(float(p.get("contracts") or 0))
-                entry = float(p.get("entryPrice") or 0)
-                if entry <= 0:
-                    raise RuntimeError(f"Exchange returned invalid {side} entryPrice: {entry}")
-                was_known = state_file_was_loaded and float(s.get("initial_entry") or 0) > 0
-                s["entry_price"] = entry
-                s["contracts"] = contracts
-                if not was_known:
-                    s["initial_entry"] = entry
-                    s["grid_step"] = 0
-                    s["recovery_uncertain"] = True
-                    log.warning(
-                        "%s adopted at avg entry=%s. Original anchor/filled grid level unknown; GRID suspended.",
-                        side, entry
-                    )
-                    await telegram(
-                        self.session,
-                        f"⚠️ <b>{SYMBOL_DISPLAY} {side}: позиция подхвачена</b>\n"
-                        f"Средняя цена: {entry}\nОбъём контрактов: {contracts}\n"
-                        "Исходная точка и уровень сетки неизвестны: новые GRID-ордера временно отключены."
-                    )
-                else:
-                    log.info("%s recovered: contracts=%s avg_entry=%s anchor=%s step=%s",
-                             side, contracts, entry, s["initial_entry"], s["grid_step"])
-            else:
-                self.state[key] = self._empty_side()
-
-        # Start a fresh two-sided cycle only when the exchange is flat for that side.
-        ticker = await self.exchange.fetch_ticker(SYMBOL)
-        current_price = float(ticker.get("last") or ticker.get("close") or 0)
-        if current_price <= 0:
-            raise RuntimeError("Could not obtain a valid market price for initial orders")
-        for side in ("LONG", "SHORT"):
-            if positions[side] is None:
-                await self.open_base_position(side, current_price)
-        self._save_state()
-
-    async def _ensure_tp(self, side: str, position: dict, orders: dict):
-        key = side.lower()
-        s = self.state[key]
-        contracts = abs(float(position.get("contracts") or 0))
-        entry = float(position.get("entryPrice") or 0)
-        if contracts <= 0 or entry <= 0:
-            return
-
-        target = entry * (1 + WINNER_TAKE_PROFIT_PCT / 100) if side == "LONG" else \
-                 entry * (1 - WINNER_TAKE_PROFIT_PCT / 100)
-        target = self.price_precision(target)
-        candidates = orders[f"{side}_TP"]
-
-        # Keep one TP only if its quantity and price still match the live position.
-        keep = None
-        for order in candidates:
-            o_amount = float(order.get("amount") or 0)
-            o_price = float(order.get("price") or 0)
-            amount_ok = abs(o_amount - contracts) <= max(1e-10, contracts * 0.0005)
-            price_ok = o_price > 0 and abs(o_price - target) <= max(1e-10, target * 0.000001)
-            if keep is None and amount_ok and price_ok:
-                keep = order
-            else:
-                await self.cancel_order(order["id"])
-
-        if keep:
-            s["tp_order_id"] = str(keep["id"])
-            return
-
-        if s.get("tp_order_id"):
-            # Stale in-memory ID is not evidence that an order is still open.
-            s["tp_order_id"] = None
-
-        order_side = "sell" if side == "LONG" else "buy"
-        amount = self.amount_precision(contracts)
-        if amount <= 0:
-            raise RuntimeError(f"Invalid TP quantity for {side}: {amount}")
-        created = await self.create_order(
-            "limit", order_side, amount, target,
-            {"positionSide": side, "timeInForce": "GTC"}
-        )
-        s["tp_order_id"] = str(created["id"])
-        s["tp_created_at"] = time.time()
-        log.info("%s TP set: id=%s qty=%s price=%s", side, created["id"], amount, target)
-        self._save_state()
-
-    async def _ensure_grid(self, side: str, position: dict, orders: dict):
-        key = side.lower()
-        s = self.state[key]
-        existing = orders[f"{side}_GRID"]
-        if s.get("recovery_uncertain"):
-            # Do not invent the original grid anchor/level after a cold recovery.
-            for order in existing:
-                log.warning("%s existing grid order %s left untouched during uncertain recovery",
-                            side, order["id"])
-            return
-
-        # Only one visible averaging order is intended. Keep one matching the next level.
-        next_step = int(s.get("grid_step") or 0) + 1
-        if next_step > GRID_LEVELS:
-            for order in existing:
-                await self.cancel_order(order["id"])
-            s["grid_order_id"] = None
-            return
-
-        anchor = float(s.get("initial_entry") or 0)
-        if anchor <= 0:
-            log.error("%s has no valid grid anchor; GRID disabled.", side)
-            return
-
-        dist = grid_step_percent(next_step) / 100.0
-        target = anchor * (1 - dist) if side == "LONG" else anchor * (1 + dist)
-        target = self.price_precision(target)
-        qty = self.qty_for_notional(grid_step_usdc(next_step), target)
-
-        keep = None
-        for order in existing:
-            same_price = abs(float(order.get("price") or 0) - target) <= max(1e-10, target * 0.000001)
-            same_amount = abs(float(order.get("amount") or 0) - qty) <= max(1e-10, qty * 0.0005)
-            if keep is None and same_price and same_amount:
-                keep = order
-            else:
-                await self.cancel_order(order["id"])
-
-        if keep:
-            s["grid_order_id"] = str(keep["id"])
-            return
-
-        # Cancel stale grid order before replacing it.
-        s["grid_order_id"] = None
-        order_side = "buy" if side == "LONG" else "sell"
-        created = await self.create_order(
-            "limit", order_side, qty, target,
-            {"positionSide": side, "timeInForce": "GTC"}
-        )
-        s["grid_order_id"] = str(created["id"])
-        log.info("%s GRID level %s set: id=%s qty=%s price=%s",
-                 side, next_step, created["id"], qty, target)
-        self._save_state()
-
-    async def reconcile(self):
-        positions = await self.fetch_positions()
-        orders = await self.fetch_open_orders_by_side()
-
-        for side in ("LONG", "SHORT"):
-            p = positions[side]
-            key = side.lower()
-            if p:
-                self.state[key]["entry_price"] = float(p.get("entryPrice") or 0)
-                self.state[key]["contracts"] = abs(float(p.get("contracts") or 0))
-                await self._ensure_tp(side, p, orders)
-                # Refresh open orders after TP/grid changes only on next poll.
-                await self._ensure_grid(side, p, orders)
-            else:
-                # Reopen the winner only after a completed TP and confirmed flat position.
-                if self.state[key].get("pending_reopen") and not DRY_RUN:
-                    ticker = await self.exchange.fetch_ticker(SYMBOL)
-                    price = float(ticker.get("last") or ticker.get("close") or 0)
-                    if price <= 0:
-                        raise RuntimeError("Invalid price while reopening after TP")
-                    await self.open_base_position(side, price)
-                elif self.state[key].get("pending_reopen") and DRY_RUN:
-                    log.warning("DRY_RUN: pending reopen for %s; no simulated position engine is enabled.", side)
-                else:
-                    # Position was closed outside the tracked TP flow. Do not leave
-                    # resting TP/GRID orders that could create unintended exposure.
-                    for stale_id in (self.state[key].get("tp_order_id"),
-                                     self.state[key].get("grid_order_id")):
-                        if stale_id:
-                            await self.cancel_order(stale_id)
-                    self.state[key] = self._empty_side()
-        self._save_state()
-
-    async def fetch_order_trades(self, order_id: str):
-        """Return actual fills belonging to one exchange order, not arbitrary last closed order."""
-        if not order_id or str(order_id).startswith("dry-"):
-            return []
+    def round_amount(self, amount):
         try:
-            # Binance supports orderId in myTrades params; use a bounded time window too.
-            since = int((time.time() - 7 * 24 * 3600) * 1000)
-            trades = await self.exchange.fetch_my_trades(
-                SYMBOL, since=since, limit=1000, params={"orderId": order_id}
-            )
-            return [t for t in trades if str((t.get("info") or {}).get("orderId", t.get("order"))) == str(order_id)]
+            precision = self.market_info.get('precision', {}).get('amount')
+            if precision is not None:
+                if isinstance(precision, int):
+                    return round(amount, precision)
+                elif isinstance(precision, float) and precision > 0:
+                    precision_digits = abs(int(math.log10(precision)))
+                    return round(amount, precision_digits)
+            return float(self.exchange.amount_to_precision(SYMBOL, amount))
         except Exception:
-            log.exception("Could not fetch fills for TP order %s", order_id)
-            return []
+            return round(amount, 3)
 
-    @staticmethod
-    def aggregate_trade_fills(trades):
-        gross = 0.0
-        fees_by_currency = {}
-        filled = 0.0
-        for trade in trades:
-            info = trade.get("info") or {}
-            realized = info.get("realizedPnl")
-            if realized is not None:
-                gross += float(realized)
-            else:
-                # Do not fabricate realized PnL from price*amount: use exchange income data.
-                pass
-            filled += float(trade.get("amount") or 0)
-            fee = trade.get("fee") or {}
-            if fee.get("cost") is not None:
-                currency = fee.get("currency") or "UNKNOWN"
-                fees_by_currency[currency] = fees_by_currency.get(currency, 0.0) + abs(float(fee["cost"]))
-            elif info.get("commission") is not None:
-                currency = info.get("commissionAsset") or "UNKNOWN"
-                fees_by_currency[currency] = fees_by_currency.get(currency, 0.0) + abs(float(info["commission"]))
-        return gross, fees_by_currency, filled
+    def round_price(self, price):
+        try:
+            return float(self.exchange.price_to_precision(SYMBOL, price))
+        except Exception:
+            return round(price, 2)
 
-    async def report_tp(self, side: str, order_id: str, expected_qty: float):
-        trades = await self.fetch_order_trades(order_id)
-        if not trades:
-            await telegram(
-                self.session,
-                f"⚠️ <b>{SYMBOL_DISPLAY} {side}: TP исполнен</b>\n"
-                f"Биржа подтвердила закрытие ордера {order_id}, но история исполнений пока недоступна. "
-                "PnL/комиссия не подменяются приблизительными значениями."
-            )
-            return
+    def calculate_qty_for_usdc(self, usdc_volume, price):
+        if price <= 0:
+            return 0.0
 
-        gross, fees, filled = self.aggregate_trade_fills(trades)
-        fee_text = ", ".join(f"{v:.6f} {k}" for k, v in fees.items()) or "нет данных"
-        fee_usdc = fees.get("USDC")
-        net = gross - fee_usdc if fee_usdc is not None else None
-        full = filled >= expected_qty * 0.999
-        msg = (
-            f"✅ <b>TP {side} — {SYMBOL_DISPLAY}</b>\n"
-            f"Исполнено: {filled:.8f} / {expected_qty:.8f} контрактов\n"
-            f"Gross realized PnL: {gross:+.6f} USDC\n"
-            f"Комиссия: {fee_text}\n"
-        )
-        if net is not None:
-            msg += f"Net PnL (Gross − USDC fee): <b>{net:+.6f} USDC</b>\n"
-        else:
-            msg += "Net PnL: не рассчитан — комиссия списана не в USDC или валюта комиссии неизвестна.\n"
-        msg += f"Закрытие полное: {'да' if full else 'нет, частичное'}"
-        await telegram(self.session, msg)
+        raw_qty = usdc_volume / price
+        precision = self.market_info.get('precision', {}).get('amount')
+        digits = 3
+        if isinstance(precision, int):
+            digits = precision
+        elif isinstance(precision, float) and precision > 0:
+            digits = abs(int(math.log10(precision)))
 
-    async def process_tp_events(self):
-        """
-        Detect TP completion from order status, then account only fills belonging
-        to that TP order. Position-size changes alone never trigger a reopen.
-        """
-        for side in ("LONG", "SHORT"):
-            s = self.state[side.lower()]
-            order_id = s.get("tp_order_id")
-            if not order_id or str(order_id).startswith("dry-"):
-                continue
+        qty = round(raw_qty, digits)
+        limits = self.market_info.get('limits', {})
+        min_qty = limits.get('amount', {}).get('min', 0.001)
+        if qty < min_qty:
+            qty = round(min_qty, digits)
+
+        return qty
+
+    async def get_actual_position_entry_price(self, position_side):
+        for _ in range(5):
             try:
-                order = await self.exchange.fetch_order(str(order_id), SYMBOL)
-            except ccxt.OrderNotFound:
-                # Missing order is not proof of a fill (could have been cancelled).
-                s["tp_order_id"] = None
-                continue
-            except Exception:
-                log.exception("fetch_order failed for %s TP %s", side, order_id)
-                continue
+                positions = await self.exchange.fetch_positions([SYMBOL])
+                pos = next((p for p in positions if p['side'] == position_side.lower() and float(p['contracts']) > 0), None)
+                if pos:
+                    return float(pos['entryPrice']), float(pos['contracts'])
+            except Exception as e:
+                logger.error(f"Ошибка получения позиции {position_side}: {e}")
+            await asyncio.sleep(0.5)
+        return 0.0, 0.0
 
-            status = str(order.get("status") or "").lower()
-            filled = float(order.get("filled") or 0)
-            amount = float(order.get("amount") or 0)
-            if status == "closed" or (amount > 0 and filled >= amount * 0.999):
-                await self.report_tp(side, str(order_id), amount)
-                # A full TP can flatten this hedge side. Cancel its resting GRID order
-                # before any automatic reopen, otherwise that stale order could add
-                # exposure to the newly opened cycle later.
-                grid_order_id = s.get("grid_order_id")
-                if grid_order_id:
-                    await self.cancel_order(grid_order_id)
-                    s["grid_order_id"] = None
-                s["tp_order_id"] = None
-                s["pending_reopen"] = True
-                # Reopen only after the exchange confirms that the old side is flat.
-                log.info("%s TP order %s closed; waiting for flat-position confirmation.", side, order_id)
-                self._save_state()
-            elif status in ("canceled", "rejected", "expired"):
-                s["tp_order_id"] = None
-                self._save_state()
-
-    async def process_grid_events(self):
-        for side in ("LONG", "SHORT"):
-            s = self.state[side.lower()]
-            order_id = s.get("grid_order_id")
-            if not order_id or str(order_id).startswith("dry-"):
-                continue
+    async def fetch_trade_and_pnl_details(self):
+        """Собирает реальный PnL, комиссии и баланс через fetch_closed_orders и fetch_balance"""
+        for attempt in range(5):
+            await asyncio.sleep(1.5)
             try:
-                order = await self.exchange.fetch_order(str(order_id), SYMBOL)
-            except ccxt.OrderNotFound:
-                s["grid_order_id"] = None
-                self._save_state()
-                continue
-            except Exception:
-                log.exception("fetch_order failed for %s GRID %s", side, order_id)
-                continue
+                closed_orders = await self.exchange.fetch_closed_orders(SYMBOL, limit=5)
+                realized_pnl = 0.0
+                fee_paid = 0.0
 
-            status = str(order.get("status") or "").lower()
-            amount = float(order.get("amount") or 0)
-            filled = float(order.get("filled") or 0)
-            if status == "closed" or (amount > 0 and filled >= amount * 0.999):
-                s["grid_step"] = min(GRID_LEVELS, int(s.get("grid_step") or 0) + 1)
-                s["grid_order_id"] = None
-                log.info("%s GRID level %s filled.", side, s["grid_step"])
-                await telegram(
-                    self.session,
-                    f"🎯 <b>{SYMBOL_DISPLAY}: усреднение {side}</b>\n"
-                    f"Выполнен уровень {s['grid_step']}/{GRID_LEVELS}"
+                for order in reversed(closed_orders):
+                    info = order.get('info', {})
+                    pnl = float(info.get('realizedPnl', 0.0))
+                    
+                    fee_cost = 0.0
+                    for fee_item in order.get('fees', []):
+                        fee_cost += float(fee_item.get('cost', 0.0))
+                    if fee_cost == 0.0:
+                        fee_cost = float(info.get('cumCommission', 0.0))
+
+                    if pnl != 0.0 or fee_cost != 0.0:
+                        realized_pnl += pnl
+                        fee_paid += abs(fee_cost)
+                        break
+
+                net_profit = realized_pnl - fee_paid
+
+                balance_data = await self.exchange.fetch_balance()
+                usdc_free = balance_data.get('USDC', {}).get('free', 0.0)
+                usdc_total = balance_data.get('USDC', {}).get('total', 0.0)
+
+                return {
+                    'gross': realized_pnl,
+                    'fee': fee_paid,
+                    'net': net_profit,
+                    'balance': usdc_total if usdc_total > 0 else usdc_free
+                }
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка получения деталей сделки: {e}")
+        return {'gross': 0.0, 'fee': 0.0, 'net': 0.0, 'balance': 0.0}
+
+    async def audit_and_sync_all_orders(self):
+        try:
+            open_orders = await self.exchange.fetch_open_orders(SYMBOL)
+            positions = await self.exchange.fetch_positions([SYMBOL])
+
+            long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+            short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
+
+            existing_tp_long = None
+            existing_tp_short = None
+            existing_grid_long = {}
+            existing_grid_short = {}
+
+            for o in open_orders:
+                o_id = str(o['id'])
+                o_pos_side = str(o.get('info', {}).get('positionSide', '')).upper()
+                o_side = str(o['side']).upper()
+                
+                if o_pos_side == 'LONG' and o_side == 'SELL':
+                    existing_tp_long = o
+                elif o_pos_side == 'SHORT' and o_side == 'BUY':
+                    existing_tp_short = o
+                elif o_pos_side == 'LONG' and o_side == 'BUY':
+                    existing_grid_long[o_id] = o
+                elif o_pos_side == 'SHORT' and o_side == 'SELL':
+                    existing_grid_short[o_id] = o
+
+            self.active_limit_orders.clear()
+
+            # --- 1. LONG TP ---
+            if long_pos and float(long_pos['contracts']) > 0:
+                l_contracts = float(long_pos['contracts'])
+                if existing_tp_long:
+                    self.long_tp_order_id = str(existing_tp_long['id'])
+                elif not self.long_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
+                    l_entry = float(long_pos['entryPrice'])
+                    tp_price = self.round_price(l_entry * (1.0 + (WINNER_TAKE_PROFIT_PCT / 100.0)))
+                    tp_qty = self.round_amount(l_contracts)
+                    try:
+                        new_ord = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'sell', tp_qty, tp_price,
+                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
+                        )
+                        self.long_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан TP_LONG по ${tp_price:,.2f}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания TP_LONG: {e}")
+
+            # --- 2. SHORT TP ---
+            if short_pos and float(short_pos['contracts']) > 0:
+                s_contracts = float(short_pos['contracts'])
+                if existing_tp_short:
+                    self.short_tp_order_id = str(existing_tp_short['id'])
+                elif not self.short_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
+                    s_entry = float(short_pos['entryPrice'])
+                    tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
+                    tp_qty = self.round_amount(s_contracts)
+                    try:
+                        new_ord = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'buy', tp_qty, tp_price,
+                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
+                        )
+                        self.short_tp_order_id = str(new_ord['id'])
+                        logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан TP_SHORT по ${tp_price:,.2f}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка создания TP_SHORT: {e}")
+
+            # --- 3. LONG Grid ---
+            if long_pos and float(long_pos['contracts']) > 0 and self.initial_long_entry > 0:
+                if existing_grid_long:
+                    grid_id, grid_obj = list(existing_grid_long.items())[0]
+                    next_step = self.long_loser_step + 1
+                    self.active_limit_orders[f"LONG_{next_step}"] = grid_id
+                else:
+                    next_step = self.long_loser_step + 1
+                    if next_step <= GRID_LEVELS:
+                        target_usdc = get_step_usdc_volume(next_step)
+                        dist_pct = get_grid_step_percent(next_step)
+                        grid_price = self.round_price(self.initial_long_entry * (1.0 - (dist_pct / 100.0)))
+                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
+                        try:
+                            new_ord = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'buy', grid_qty, grid_price,
+                                params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
+                            )
+                            self.active_limit_orders[f"LONG_{next_step}"] = str(new_ord['id'])
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания лимитника LONG: {e}")
+
+            # --- 4. SHORT Grid ---
+            if short_pos and float(short_pos['contracts']) > 0 and self.initial_short_entry > 0:
+                if existing_grid_short:
+                    grid_id, grid_obj = list(existing_grid_short.items())[0]
+                    next_step = self.short_loser_step + 1
+                    self.active_limit_orders[f"SHORT_{next_step}"] = grid_id
+                else:
+                    next_step = self.short_loser_step + 1
+                    if next_step <= GRID_LEVELS:
+                        target_usdc = get_step_usdc_volume(next_step)
+                        dist_pct = get_grid_step_percent(next_step)
+                        grid_price = self.round_price(self.initial_short_entry * (1.0 + (dist_pct / 100.0)))
+                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
+                        try:
+                            new_ord = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'sell', grid_qty, grid_price,
+                                params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
+                            )
+                            self.active_limit_orders[f"SHORT_{next_step}"] = str(new_ord['id'])
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка создания лимитника SHORT: {e}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в аудите ордеров: {e}")
+
+    async def recover_state_or_init(self):
+        async with self.exec_lock:
+            logger.info(f"🔄 Сканирование биржи и подхват позиций для {SYMBOL_DISPLAY}...")
+
+            positions = []
+            for attempt in range(3):
+                try:
+                    positions = await self.exchange.fetch_positions([SYMBOL])
+                    break
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка запроса позиций: {e}")
+                    await asyncio.sleep(1)
+
+            ticker = await self.exchange.fetch_ticker(SYMBOL)
+            current_price = float(ticker['last'])
+
+            long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+            short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
+
+            # --- LONG ---
+            if long_pos:
+                long_contracts = float(long_pos['contracts'])
+                self.long_entry_price = float(long_pos['entryPrice'])
+                self.initial_long_entry = self.long_entry_price
+                self.long_contracts_prev = long_contracts
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.long_entry_price:,.2f} | Объем: {long_contracts}"
                 )
-                self._save_state()
-            elif status in ("canceled", "rejected", "expired"):
-                s["grid_order_id"] = None
-                self._save_state()
+            else:
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден! Открываем базу...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
+                l_entry, l_contracts = await self.get_actual_position_entry_price('LONG')
+                self.long_entry_price = l_entry if l_entry > 0 else current_price
+                self.initial_long_entry = self.long_entry_price
+                self.long_contracts_prev = l_contracts if l_contracts > 0 else base_qty
+                self.long_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}"
+                )
+
+            # --- SHORT ---
+            if short_pos:
+                short_contracts = float(short_pos['contracts'])
+                self.short_entry_price = float(short_pos['entryPrice'])
+                self.initial_short_entry = self.short_entry_price
+                self.short_contracts_prev = short_contracts
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.short_entry_price:,.2f} | Объем: {short_contracts}"
+                )
+            else:
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден! Открываем базу...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
+                s_entry, s_contracts = await self.get_actual_position_entry_price('SHORT')
+                self.short_entry_price = s_entry if s_entry > 0 else current_price
+                self.initial_short_entry = self.short_entry_price
+                self.short_contracts_prev = s_contracts if s_contracts > 0 else base_qty
+                self.short_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}"
+                )
+
+            await self.audit_and_sync_all_orders()
+
+    async def reopen_winner_position(self, current_price, winner_side):
+        async with self.exec_lock:
+            triggered_step = self.long_loser_step if winner_side == 'LONG' else self.short_loser_step
+            step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
+            direction_text = "BUY" if winner_side == 'LONG' else "SELL"
+
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
+
+            qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+            side = 'buy' if winner_side == 'LONG' else 'sell'
+
+            actual_entry = 0.0
+            actual_contracts = 0.0
+
+            # Сбрасываем ID старого тейка перед переоткрытием
+            if winner_side == 'LONG':
+                self.long_tp_order_id = None
+            else:
+                self.short_tp_order_id = None
+
+            for attempt in range(3):
+                try:
+                    await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
+                    actual_entry, actual_contracts = await self.get_actual_position_entry_price(winner_side)
+                    if actual_entry > 0:
+                        break
+                except Exception as e:
+                    logger.warning(f"⚠️ Попытка {attempt+1} переоткрытия {winner_side} не удалась: {e}")
+                    await asyncio.sleep(1.5)
+
+            if actual_entry > 0:
+                if winner_side == 'LONG':
+                    self.long_entry_price = actual_entry
+                    self.initial_long_entry = actual_entry
+                    self.long_contracts_prev = actual_contracts
+                    self.long_loser_step = 0
+                else:
+                    self.short_entry_price = actual_entry
+                    self.initial_short_entry = actual_entry
+                    self.short_contracts_prev = actual_contracts
+                    self.short_loser_step = 0
+
+                details = await self.fetch_trade_and_pnl_details()
+                net_pnl = details['net']
+                gross_pnl = details['gross']
+                fee_total = details['fee']
+                wallet_balance = details['balance']
+                
+                pnl_percent = (net_pnl / BASE_ORDER_USDC) * 100.0 if BASE_ORDER_USDC > 0 else 0.0
+
+                tg_msg = (
+                    f"✅ <b>ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                    f"Направление: {direction_text}\n"
+                    f"💰 PnL: <b>{net_pnl:+.2f} USDC ({pnl_percent:+.2f}%)</b>\n"
+                    f"📈 Выход: {current_price:,.2f} | Gross: {gross_pnl:+.2f} USDC\n"
+                    f"💸 Комиссия всего: {fee_total:.4f} USDC\n"
+                    f"💳 Баланс: {wallet_balance:.2f} USDC\n"
+                    f"🔄 <b>Новый вход:</b> ${actual_entry:,.2f} | Объем: {actual_contracts}"
+                )
+                await send_tg_message(self.http_session, tg_msg)
+            else:
+                logger.error(f"❌ Не удалось переоткрыть позицию {winner_side} после 3 попыток!")
+
+            await self.audit_and_sync_all_orders()
 
     async def main_loop(self):
-        log.info("Monitoring loop started.")
-        while self.running:
+        logger.info(f"✅ Главный цикл мониторинга для {SYMBOL_DISPLAY} запущен.")
+        while self.is_running:
             try:
-                await self.process_tp_events()
-                await self.process_grid_events()
-                await self.reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Main loop error")
-            await asyncio.sleep(POLL_SECONDS)
+                current_time = time.time()
+                open_orders = await self.exchange.fetch_open_orders(SYMBOL)
+                positions = await self.exchange.fetch_positions([SYMBOL])
+
+                long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
+                short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
+
+                long_contracts = float(long_pos['contracts']) if long_pos else 0.0
+                short_contracts = float(short_pos['contracts']) if short_pos else 0.0
+
+                # --- 1. ТЕЙК-ПРОФИТ LONG ---
+                if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
+                    drop_diff = self.long_contracts_prev - long_contracts
+                    if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
+                        self.last_long_tp_time = current_time
+                        logger.info("Исполнен тейк-профит по LONG!")
+                        for o in open_orders:
+                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
+                                try:
+                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
+                                except Exception:
+                                    pass
+                        ticker = await self.exchange.fetch_ticker(SYMBOL)
+                        await self.reopen_winner_position(float(ticker['last']), 'LONG')
+                        await asyncio.sleep(1)
+                        continue
+
+                # --- 2. ТЕЙК-ПРОФИТ SHORT ---
+                if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
+                    drop_diff = self.short_contracts_prev - short_contracts
+                    if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
+                        self.last_short_tp_time = current_time
+                        logger.info("Исполнен тейк-профит по SHORT!")
+                        for o in open_orders:
+                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
+                                try:
+                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
+                                except Exception:
+                                    pass
+                        ticker = await self.exchange.fetch_ticker(SYMBOL)
+                        await self.reopen_winner_position(float(ticker['last']), 'SHORT')
+                        await asyncio.sleep(1)
+                        continue
+
+                # --- 3. Усреднение LONG ---
+                if long_contracts > self.long_contracts_prev and self.long_contracts_prev > 0:
+                    async with self.exec_lock:
+                        self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
+                        self.long_contracts_prev = long_contracts
+                        if long_pos:
+                            self.long_entry_price = float(long_pos['entryPrice'])
+
+                        msg = f"🎯 🟢 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.long_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
+                        logger.info(msg)
+                        await send_tg_message(self.http_session, msg)
+                        await self.audit_and_sync_all_orders()
+                        continue
+
+                # --- 4. Усреднение SHORT ---
+                if short_contracts > self.short_contracts_prev and self.short_contracts_prev > 0:
+                    async with self.exec_lock:
+                        self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
+                        self.short_contracts_prev = short_contracts
+                        if short_pos:
+                            self.short_entry_price = float(short_pos['entryPrice'])
+
+                        msg = f"🎯 🔻 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.short_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
+                        logger.info(msg)
+                        await send_tg_message(self.http_session, msg)
+                        await self.audit_and_sync_all_orders()
+                        continue
+
+                self.long_contracts_prev = long_contracts
+                self.short_contracts_prev = short_contracts
+
+                await self.audit_and_sync_all_orders()
+
+            except Exception as e:
+                logger.error(f"⚠️ Ошибка в main_loop: {e}")
+                await asyncio.sleep(2)
+
+            await asyncio.sleep(1)
 
     async def run(self):
-        while self.running:
+        while self.is_running:
             try:
                 await self.initialize()
-                loaded = self._load_state()
-                await self.adopt_positions(loaded)
-                await self.reconcile()
+                await self.recover_state_or_init()
                 await self.main_loop()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Fatal bot error; reconnecting in 5 seconds.")
-                await self.close()
+            except Exception as err:
+                logger.error(f"❌ Критическая ошибка: {err}")
+                await self.safe_close_exchange()
                 await asyncio.sleep(5)
 
-
-bot = HedgeBot()
-
+bot = CCXTUsdcHedgeBot()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(bot.run())
-    try:
-        yield
-    finally:
-        bot.running = False
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        await bot.close()
-
+    loop = asyncio.get_running_loop()
+    task = loop.create_task(bot.run())
+    yield
+    bot.is_running = False
+    task.cancel()
+    if bot.exchange:
+        await bot.exchange.close()
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/")
 @app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "symbol": SYMBOL_DISPLAY,
-        "dry_run": DRY_RUN,
-        "state_file": str(STATE_FILE),
-    }
-
+async def root():
+    return {"status": "ok", "symbol": SYMBOL_DISPLAY}
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
 
 
 
