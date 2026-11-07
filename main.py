@@ -1,8 +1,8 @@
-
 import asyncio
 import os
 import time
 import math
+import json
 import aiohttp
 import ccxt.async_support as ccxt
 import uvicorn
@@ -13,15 +13,18 @@ from fastapi import FastAPI
 # 🎛️ ПАНЕЛЬ УПРАВЛЕНИЯ ПАРАМЕТРАМИ БОТА (HEDGE MODE / USDC)
 # ==============================================================================
 
-SYMBOL_RAW = os.getenv('SYMBOL', 'BTC/USDC:USDC').strip()
+SYMBOL_RAW = os.getenv('SYMBOL', 'ZEC/USDC:USDC').strip()
 SYMBOL = SYMBOL_RAW
 SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 
 LEVERAGE = int(os.getenv('LEVERAGE', 50))
-BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))  # Стартовый объем в USDC для каждой ветки
+BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
 
-GRID_LEVELS = 3                 # 3 уровня усреднения
-VISIBLE_GRID_LEVELS = 1         # По одной лимитке усреднения в стакане
+GRID_LEVELS = 3
+VISIBLE_GRID_LEVELS = 1
+
+STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
+
 
 def get_grid_step_percent(step: int) -> float:
     if step == 1:
@@ -32,6 +35,7 @@ def get_grid_step_percent(step: int) -> float:
         return 15.0
     return 15.0
 
+
 def get_step_usdc_volume(step: int) -> float:
     if step <= 1:
         return float(BASE_ORDER_USDC)
@@ -41,7 +45,8 @@ def get_step_usdc_volume(step: int) -> float:
         return float(BASE_ORDER_USDC * 4.0)
     return float(BASE_ORDER_USDC * 4.0)
 
-WINNER_TAKE_PROFIT_PCT = 0.5    # Жестко 0.5% TP для всех уровней
+
+WINNER_TAKE_PROFIT_PCT = 0.5
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
@@ -49,6 +54,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger("CCXT_USDC_HEDGE_BOT")
+
 
 async def send_tg_message(session: aiohttp.ClientSession, text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or session is None or session.closed:
@@ -67,6 +73,7 @@ async def send_tg_message(session: aiohttp.ClientSession, text: str):
             pass
     except Exception as e:
         print(f"❌ Ошибка Telegram: {e}")
+
 
 class CCXTUsdcHedgeBot:
     def __init__(self):
@@ -95,6 +102,57 @@ class CCXTUsdcHedgeBot:
         self.last_short_tp_time = 0.0
 
         self.exec_lock = asyncio.Lock()
+
+    # ============================ STATE ============================
+
+    def save_state(self):
+        try:
+            with open(STATE_FILE, 'w') as f:
+                json.dump({
+                    'long_entry_price': self.long_entry_price,
+                    'short_entry_price': self.short_entry_price,
+                    'initial_long_entry': self.initial_long_entry,
+                    'initial_short_entry': self.initial_short_entry,
+                    'long_loser_step': self.long_loser_step,
+                    'short_loser_step': self.short_loser_step,
+                }, f)
+        except Exception as e:
+            logger.error(f"⚠️ save_state: {e}")
+
+    def load_state(self):
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as f:
+                    data = json.load(f)
+                self.initial_long_entry = float(data.get('initial_long_entry', 0.0) or 0.0)
+                self.initial_short_entry = float(data.get('initial_short_entry', 0.0) or 0.0)
+                self.long_loser_step = int(data.get('long_loser_step', 0) or 0)
+                self.short_loser_step = int(data.get('short_loser_step', 0) or 0)
+                logger.info(f"📂 state загружен: L step={self.long_loser_step}, S step={self.short_loser_step}")
+        except Exception as e:
+            logger.error(f"⚠️ load_state: {e}")
+
+    def _infer_step_from_position(self, contracts: float, avg_entry: float) -> int:
+        """Определяет шаг усреднения по объёму позиции.
+        Теоретически contracts / (U/avg) = 2^(step+1) - 1 → 1, 3, 7, 15."""
+        if avg_entry <= 0 or contracts <= 0:
+            return 0
+        base_qty = BASE_ORDER_USDC / avg_entry
+        if base_qty <= 0:
+            return 0
+        ratio = contracts / base_qty
+        if ratio < 2:   return 0
+        if ratio < 5:   return 1
+        if ratio < 11:  return 2
+        return 3
+
+    def _infer_initial_entry(self, avg_entry: float, step: int) -> float:
+        """Восстанавливает первую цену входа из средней и шага усреднения.
+        Коэффициенты получены из формулы средневзвешенной цены."""
+        coef = {0: 1.0, 1: 0.9661, 2: 0.9273, 3: 0.8845}.get(step, 1.0)
+        return avg_entry / coef if coef > 0 else avg_entry
+
+    # ============================ INIT ============================
 
     def init_exchange(self):
         raw_key = os.getenv('BINANCE_API_KEY', '').strip().strip("'").strip('"')
@@ -147,6 +205,8 @@ class CCXTUsdcHedgeBot:
 
         logger.info(f"✅ Инициализация выполнена для {SYMBOL_DISPLAY}. Плечо {LEVERAGE}x CROSSED (Hedge Mode, USDC).")
 
+    # ============================ HELPERS ============================
+
     def round_amount(self, amount):
         try:
             precision = self.market_info.get('precision', {}).get('amount')
@@ -198,45 +258,67 @@ class CCXTUsdcHedgeBot:
             await asyncio.sleep(0.5)
         return 0.0, 0.0
 
-    async def fetch_trade_and_pnl_details(self):
-        """Собирает реальный PnL, комиссии и баланс через fetch_closed_orders и fetch_balance"""
-        for attempt in range(5):
+    # ============================ PnL ============================
+
+    async def fetch_tp_pnl(self, tp_order_id: str = None):
+        """Возвращает PnL и комиссию по конкретному TP-ордеру (или последнему закрытому).
+        Primary: fetch_my_trades отфильтрованные по orderId.
+        Fallback: fetch_closed_orders с cumRealizedPnl."""
+        result = {'gross': 0.0, 'fee': 0.0, 'net': 0.0, 'balance': 0.0}
+
+        # Баланс
+        try:
+            bal = await self.exchange.fetch_balance()
+            usdc_total = float(bal.get('USDC', {}).get('total', 0.0) or 0.0)
+            usdc_free = float(bal.get('USDC', {}).get('free', 0.0) or 0.0)
+            result['balance'] = usdc_total if usdc_total > 0 else usdc_free
+        except Exception:
+            pass
+
+        for _ in range(6):
             await asyncio.sleep(1.5)
             try:
-                closed_orders = await self.exchange.fetch_closed_orders(SYMBOL, limit=5)
-                realized_pnl = 0.0
-                fee_paid = 0.0
+                gross, fee = 0.0, 0.0
+                found = False
 
-                for order in reversed(closed_orders):
-                    info = order.get('info', {})
-                    pnl = float(info.get('realizedPnl', 0.0))
-                    
-                    fee_cost = 0.0
-                    for fee_item in order.get('fees', []):
-                        fee_cost += float(fee_item.get('cost', 0.0))
-                    if fee_cost == 0.0:
-                        fee_cost = float(info.get('cumCommission', 0.0))
+                if tp_order_id:
+                    try:
+                        trades = await self.exchange.fetch_my_trades(SYMBOL, limit=100)
+                    except Exception:
+                        trades = []
+                    matched = [t for t in trades if str(t.get('order')) == str(tp_order_id)]
+                    if matched:
+                        for t in matched:
+                            info = t.get('info', {})
+                            gross += float(info.get('realizedPnl', 0.0) or 0.0)
+                            fee_cost = t.get('fee', {}).get('cost')
+                            if fee_cost is None:
+                                fee_cost = info.get('commission', 0.0)
+                            fee += abs(float(fee_cost or 0.0))
+                        found = True
 
-                    if pnl != 0.0 or fee_cost != 0.0:
-                        realized_pnl += pnl
-                        fee_paid += abs(fee_cost)
-                        break
+                if not found:
+                    try:
+                        orders = await self.exchange.fetch_closed_orders(SYMBOL, limit=10)
+                    except Exception:
+                        orders = []
+                    for o in orders:
+                        info = o.get('info', {})
+                        pnl = float(info.get('cumRealizedPnl', 0.0) or 0.0)
+                        if pnl != 0.0:
+                            gross = pnl
+                            fee = abs(float(info.get('cumCommission', 0.0) or 0.0))
+                            found = True
+                            break
 
-                net_profit = realized_pnl - fee_paid
-
-                balance_data = await self.exchange.fetch_balance()
-                usdc_free = balance_data.get('USDC', {}).get('free', 0.0)
-                usdc_total = balance_data.get('USDC', {}).get('total', 0.0)
-
-                return {
-                    'gross': realized_pnl,
-                    'fee': fee_paid,
-                    'net': net_profit,
-                    'balance': usdc_total if usdc_total > 0 else usdc_free
-                }
+                if found:
+                    result.update(gross=gross, fee=fee, net=gross - fee)
+                    return result
             except Exception as e:
-                logger.error(f"⚠️ Ошибка получения деталей сделки: {e}")
-        return {'gross': 0.0, 'fee': 0.0, 'net': 0.0, 'balance': 0.0}
+                logger.error(f"⚠️ fetch_tp_pnl: {e}")
+        return result
+
+    # ============================ AUDIT ============================
 
     async def audit_and_sync_all_orders(self):
         try:
@@ -246,118 +328,185 @@ class CCXTUsdcHedgeBot:
             long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
             short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
 
-            existing_tp_long = None
-            existing_tp_short = None
-            existing_grid_long = {}
-            existing_grid_short = {}
+            tp_long, tp_short = None, None
+            grids_long, grids_short = {}, {}
 
             for o in open_orders:
-                o_id = str(o['id'])
-                o_pos_side = str(o.get('info', {}).get('positionSide', '')).upper()
-                o_side = str(o['side']).upper()
-                
-                if o_pos_side == 'LONG' and o_side == 'SELL':
-                    existing_tp_long = o
-                elif o_pos_side == 'SHORT' and o_side == 'BUY':
-                    existing_tp_short = o
-                elif o_pos_side == 'LONG' and o_side == 'BUY':
-                    existing_grid_long[o_id] = o
-                elif o_pos_side == 'SHORT' and o_side == 'SELL':
-                    existing_grid_short[o_id] = o
+                ps = str(o.get('info', {}).get('positionSide', '')).upper()
+                sd = str(o['side']).upper()
+                if ps == 'LONG' and sd == 'SELL':
+                    tp_long = o
+                elif ps == 'SHORT' and sd == 'BUY':
+                    tp_short = o
+                elif ps == 'LONG' and sd == 'BUY':
+                    grids_long[str(o['id'])] = o
+                elif ps == 'SHORT' and sd == 'SELL':
+                    grids_short[str(o['id'])] = o
+
+            SIZE_TOL = 0.03  # 3%
+
+            def size_mismatch(order, expected_qty):
+                try:
+                    actual = float(order.get('amount') or 0)
+                    if expected_qty <= 0 or actual <= 0:
+                        return True
+                    return abs(actual - expected_qty) / expected_qty > SIZE_TOL
+                except Exception:
+                    return True
+
+            # --- ORPHAN: нет позиции, но есть ордера этой стороны → отменить ---
+            if not long_pos:
+                for oid in list(grids_long.keys()) + ([str(tp_long['id'])] if tp_long else []):
+                    try:
+                        await self.exchange.cancel_order(oid, SYMBOL)
+                    except Exception:
+                        pass
+                self.long_tp_order_id = None
+                grids_long.clear()
+            if not short_pos:
+                for oid in list(grids_short.keys()) + ([str(tp_short['id'])] if tp_short else []):
+                    try:
+                        await self.exchange.cancel_order(oid, SYMBOL)
+                    except Exception:
+                        pass
+                self.short_tp_order_id = None
+                grids_short.clear()
 
             self.active_limit_orders.clear()
 
-            # --- 1. LONG TP ---
-            if long_pos and float(long_pos['contracts']) > 0:
+            # ===================== LONG =====================
+            if long_pos:
                 l_contracts = float(long_pos['contracts'])
-                if existing_tp_long:
-                    self.long_tp_order_id = str(existing_tp_long['id'])
-                elif not self.long_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
-                    l_entry = float(long_pos['entryPrice'])
+                l_entry = float(long_pos['entryPrice'])
+
+                # 1) TP LONG
+                if tp_long and size_mismatch(tp_long, l_contracts):
+                    try:
+                        await self.exchange.cancel_order(str(tp_long['id']), SYMBOL)
+                        logger.info(f"🔁 TP_LONG отменён: размер {tp_long.get('amount')} ≠ позиции {l_contracts}")
+                        tp_long = None
+                        self.long_tp_order_id = None
+                    except Exception as e:
+                        logger.error(f"❌ cancel TP_LONG: {e}")
+
+                if tp_long:
+                    self.long_tp_order_id = str(tp_long['id'])
+                    logger.info(f"🟢 TP_LONG подхвачен (size={tp_long.get('amount')} @ ${float(tp_long['price']):,.2f})")
+                elif not self.long_tp_order_id:
                     tp_price = self.round_price(l_entry * (1.0 + (WINNER_TAKE_PROFIT_PCT / 100.0)))
-                    tp_qty = self.round_amount(l_contracts)
                     try:
-                        new_ord = await self.exchange.create_order(
-                            SYMBOL, 'LIMIT', 'sell', tp_qty, tp_price,
-                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
-                        )
-                        self.long_tp_order_id = str(new_ord['id'])
-                        logger.info(f"📥 🟢 [{SYMBOL_DISPLAY}] Создан TP_LONG по ${tp_price:,.2f}")
+                        n = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'sell', self.round_amount(l_contracts), tp_price,
+                            params={'positionSide': 'LONG', 'timeInForce': 'GTC'})
+                        self.long_tp_order_id = str(n['id'])
+                        logger.info(f"📥 TP_LONG создан @ ${tp_price:,.2f} size={self.round_amount(l_contracts)}")
                     except Exception as e:
-                        logger.error(f"❌ Ошибка создания TP_LONG: {e}")
+                        logger.error(f"❌ create TP_LONG: {e}")
 
-            # --- 2. SHORT TP ---
-            if short_pos and float(short_pos['contracts']) > 0:
+                # 2) Grid LONG
+                next_step = self.long_loser_step + 1
+                if next_step <= GRID_LEVELS:
+                    if grids_long:
+                        gid, gobj = list(grids_long.items())[0]
+                        expected_qty = self.calculate_qty_for_usdc(
+                            get_step_usdc_volume(next_step), float(gobj['price']) or l_entry)
+                        if size_mismatch(gobj, expected_qty):
+                            try:
+                                await self.exchange.cancel_order(gid, SYMBOL)
+                                logger.info(f"🔁 Grid_LONG#{next_step} отменён: размер {gobj.get('amount')} ≠ ожидаемого {expected_qty}")
+                                grids_long.clear()
+                            except Exception as e:
+                                logger.error(f"❌ cancel grid_LONG: {e}")
+                        else:
+                            self.active_limit_orders[f"LONG_{next_step}"] = gid
+                            logger.info(f"🟢 Grid_LONG#{next_step} подхвачен (size={gobj.get('amount')})")
+
+                    if not grids_long:
+                        dist = get_grid_step_percent(next_step)
+                        gprice = self.round_price(self.initial_long_entry * (1.0 - (dist / 100.0)))
+                        gqty = self.calculate_qty_for_usdc(get_step_usdc_volume(next_step), gprice)
+                        try:
+                            n = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'buy', gqty, gprice,
+                                params={'positionSide': 'LONG', 'timeInForce': 'GTC'})
+                            self.active_limit_orders[f"LONG_{next_step}"] = str(n['id'])
+                            logger.info(f"📥 Grid_LONG#{next_step} создан @ ${gprice:,.2f} size={gqty}")
+                        except Exception as e:
+                            logger.error(f"❌ create grid_LONG: {e}")
+                else:
+                    logger.info(f"ℹ️ LONG: усреднение достигло предела ({GRID_LEVELS}), сетку не ставим")
+
+            # ===================== SHORT =====================
+            if short_pos:
                 s_contracts = float(short_pos['contracts'])
-                if existing_tp_short:
-                    self.short_tp_order_id = str(existing_tp_short['id'])
-                elif not self.short_tp_order_id:  # Создаем только если ID еще не был зафиксирован в памяти
-                    s_entry = float(short_pos['entryPrice'])
-                    tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
-                    tp_qty = self.round_amount(s_contracts)
+                s_entry = float(short_pos['entryPrice'])
+
+                if tp_short and size_mismatch(tp_short, s_contracts):
                     try:
-                        new_ord = await self.exchange.create_order(
-                            SYMBOL, 'LIMIT', 'buy', tp_qty, tp_price,
-                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
-                        )
-                        self.short_tp_order_id = str(new_ord['id'])
-                        logger.info(f"📥 🔻 [{SYMBOL_DISPLAY}] Создан TP_SHORT по ${tp_price:,.2f}")
+                        await self.exchange.cancel_order(str(tp_short['id']), SYMBOL)
+                        logger.info(f"🔁 TP_SHORT отменён: размер {tp_short.get('amount')} ≠ позиции {s_contracts}")
+                        tp_short = None
+                        self.short_tp_order_id = None
                     except Exception as e:
-                        logger.error(f"❌ Ошибка создания TP_SHORT: {e}")
+                        logger.error(f"❌ cancel TP_SHORT: {e}")
 
-            # --- 3. LONG Grid ---
-            if long_pos and float(long_pos['contracts']) > 0 and self.initial_long_entry > 0:
-                if existing_grid_long:
-                    grid_id, grid_obj = list(existing_grid_long.items())[0]
-                    next_step = self.long_loser_step + 1
-                    self.active_limit_orders[f"LONG_{next_step}"] = grid_id
-                else:
-                    next_step = self.long_loser_step + 1
-                    if next_step <= GRID_LEVELS:
-                        target_usdc = get_step_usdc_volume(next_step)
-                        dist_pct = get_grid_step_percent(next_step)
-                        grid_price = self.round_price(self.initial_long_entry * (1.0 - (dist_pct / 100.0)))
-                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
-                        try:
-                            new_ord = await self.exchange.create_order(
-                                SYMBOL, 'LIMIT', 'buy', grid_qty, grid_price,
-                                params={'positionSide': 'LONG', 'timeInForce': 'GTC'}
-                            )
-                            self.active_limit_orders[f"LONG_{next_step}"] = str(new_ord['id'])
-                        except Exception as e:
-                            logger.error(f"❌ Ошибка создания лимитника LONG: {e}")
+                if tp_short:
+                    self.short_tp_order_id = str(tp_short['id'])
+                    logger.info(f"🔻 TP_SHORT подхвачен (size={tp_short.get('amount')} @ ${float(tp_short['price']):,.2f})")
+                elif not self.short_tp_order_id:
+                    tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
+                    try:
+                        n = await self.exchange.create_order(
+                            SYMBOL, 'LIMIT', 'buy', self.round_amount(s_contracts), tp_price,
+                            params={'positionSide': 'SHORT', 'timeInForce': 'GTC'})
+                        self.short_tp_order_id = str(n['id'])
+                        logger.info(f"📥 TP_SHORT создан @ ${tp_price:,.2f} size={self.round_amount(s_contracts)}")
+                    except Exception as e:
+                        logger.error(f"❌ create TP_SHORT: {e}")
 
-            # --- 4. SHORT Grid ---
-            if short_pos and float(short_pos['contracts']) > 0 and self.initial_short_entry > 0:
-                if existing_grid_short:
-                    grid_id, grid_obj = list(existing_grid_short.items())[0]
-                    next_step = self.short_loser_step + 1
-                    self.active_limit_orders[f"SHORT_{next_step}"] = grid_id
-                else:
-                    next_step = self.short_loser_step + 1
-                    if next_step <= GRID_LEVELS:
-                        target_usdc = get_step_usdc_volume(next_step)
-                        dist_pct = get_grid_step_percent(next_step)
-                        grid_price = self.round_price(self.initial_short_entry * (1.0 + (dist_pct / 100.0)))
-                        grid_qty = self.calculate_qty_for_usdc(target_usdc, grid_price)
+                next_step = self.short_loser_step + 1
+                if next_step <= GRID_LEVELS:
+                    if grids_short:
+                        gid, gobj = list(grids_short.items())[0]
+                        expected_qty = self.calculate_qty_for_usdc(
+                            get_step_usdc_volume(next_step), float(gobj['price']) or s_entry)
+                        if size_mismatch(gobj, expected_qty):
+                            try:
+                                await self.exchange.cancel_order(gid, SYMBOL)
+                                logger.info(f"🔁 Grid_SHORT#{next_step} отменён: размер не совпадает")
+                                grids_short.clear()
+                            except Exception as e:
+                                logger.error(f"❌ cancel grid_SHORT: {e}")
+                        else:
+                            self.active_limit_orders[f"SHORT_{next_step}"] = gid
+                            logger.info(f"🔻 Grid_SHORT#{next_step} подхвачен")
+                    if not grids_short:
+                        dist = get_grid_step_percent(next_step)
+                        gprice = self.round_price(self.initial_short_entry * (1.0 + (dist / 100.0)))
+                        gqty = self.calculate_qty_for_usdc(get_step_usdc_volume(next_step), gprice)
                         try:
-                            new_ord = await self.exchange.create_order(
-                                SYMBOL, 'LIMIT', 'sell', grid_qty, grid_price,
-                                params={'positionSide': 'SHORT', 'timeInForce': 'GTC'}
-                            )
-                            self.active_limit_orders[f"SHORT_{next_step}"] = str(new_ord['id'])
+                            n = await self.exchange.create_order(
+                                SYMBOL, 'LIMIT', 'sell', gqty, gprice,
+                                params={'positionSide': 'SHORT', 'timeInForce': 'GTC'})
+                            self.active_limit_orders[f"SHORT_{next_step}"] = str(n['id'])
+                            logger.info(f"📥 Grid_SHORT#{next_step} создан @ ${gprice:,.2f} size={gqty}")
                         except Exception as e:
-                            logger.error(f"❌ Ошибка создания лимитника SHORT: {e}")
+                            logger.error(f"❌ create grid_SHORT: {e}")
+                else:
+                    logger.info(f"ℹ️ SHORT: усреднение достигло предела ({GRID_LEVELS}), сетку не ставим")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка в аудите ордеров: {e}")
+            logger.error(f"❌ audit_and_sync_all_orders: {e}")
+
+    # ============================ RECOVER ============================
 
     async def recover_state_or_init(self):
         async with self.exec_lock:
             logger.info(f"🔄 Сканирование биржи и подхват позиций для {SYMBOL_DISPLAY}...")
+            self.load_state()
 
             positions = []
-            for attempt in range(3):
+            for _ in range(3):
                 try:
                     positions = await self.exchange.fetch_positions([SYMBOL])
                     break
@@ -373,120 +522,164 @@ class CCXTUsdcHedgeBot:
 
             # --- LONG ---
             if long_pos:
-                long_contracts = float(long_pos['contracts'])
-                self.long_entry_price = float(long_pos['entryPrice'])
-                self.initial_long_entry = self.long_entry_price
-                self.long_contracts_prev = long_contracts
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
-                await send_tg_message(
-                    self.http_session,
-                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.long_entry_price:,.2f} | Объем: {long_contracts}"
-                )
+                contracts = float(long_pos['contracts'])
+                avg = float(long_pos['entryPrice'])
+                inferred_step = self._infer_step_from_position(contracts, avg)
+
+                if self.initial_long_entry > 0 and self.long_loser_step == inferred_step:
+                    logger.info(f"📂 LONG state OK: step={inferred_step}, init=${self.initial_long_entry:,.2f}")
+                else:
+                    self.long_loser_step = inferred_step
+                    self.initial_long_entry = self._infer_initial_entry(avg, inferred_step)
+                    logger.warning(f"⚠️ LONG state скорректирован → step={inferred_step}, init≈${self.initial_long_entry:,.2f}")
+
+                self.long_entry_price = avg
+                self.long_contracts_prev = contracts
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {contracts} | Avg: ${avg:,.2f} | Step: {inferred_step}")
+                await send_tg_message(self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG подхвачен</b>\n"
+                    f"Avg: ${avg:,.2f} | Step: {inferred_step}/{GRID_LEVELS} | Объём: {contracts}")
             else:
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден! Открываем базу...")
+                self.long_loser_step = 0
+                self.initial_long_entry = 0.0
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден. Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
-                l_entry, l_contracts = await self.get_actual_position_entry_price('LONG')
+                l_entry, l_ct = await self.get_actual_position_entry_price('LONG')
                 self.long_entry_price = l_entry if l_entry > 0 else current_price
                 self.initial_long_entry = self.long_entry_price
-                self.long_contracts_prev = l_contracts if l_contracts > 0 else base_qty
-                self.long_loser_step = 0
-                await send_tg_message(
-                    self.http_session,
-                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}"
-                )
+                self.long_contracts_prev = l_ct if l_ct > 0 else base_qty
+                await send_tg_message(self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}")
 
             # --- SHORT ---
             if short_pos:
-                short_contracts = float(short_pos['contracts'])
-                self.short_entry_price = float(short_pos['entryPrice'])
-                self.initial_short_entry = self.short_entry_price
-                self.short_contracts_prev = short_contracts
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
-                await send_tg_message(
-                    self.http_session,
-                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.short_entry_price:,.2f} | Объем: {short_contracts}"
-                )
+                contracts = float(short_pos['contracts'])
+                avg = float(short_pos['entryPrice'])
+                inferred_step = self._infer_step_from_position(contracts, avg)
+
+                if self.initial_short_entry > 0 and self.short_loser_step == inferred_step:
+                    logger.info(f"📂 SHORT state OK: step={inferred_step}")
+                else:
+                    self.short_loser_step = inferred_step
+                    self.initial_short_entry = self._infer_initial_entry(avg, inferred_step)
+                    logger.warning(f"⚠️ SHORT state скорректирован → step={inferred_step}, init≈${self.initial_short_entry:,.2f}")
+
+                self.short_entry_price = avg
+                self.short_contracts_prev = contracts
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {contracts} | Avg: ${avg:,.2f} | Step: {inferred_step}")
+                await send_tg_message(self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT подхвачен</b>\n"
+                    f"Avg: ${avg:,.2f} | Step: {inferred_step}/{GRID_LEVELS} | Объём: {contracts}")
             else:
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден! Открываем базу...")
+                self.short_loser_step = 0
+                self.initial_short_entry = 0.0
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден. Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
-                s_entry, s_contracts = await self.get_actual_position_entry_price('SHORT')
+                s_entry, s_ct = await self.get_actual_position_entry_price('SHORT')
                 self.short_entry_price = s_entry if s_entry > 0 else current_price
                 self.initial_short_entry = self.short_entry_price
-                self.short_contracts_prev = s_contracts if s_contracts > 0 else base_qty
-                self.short_loser_step = 0
-                await send_tg_message(
-                    self.http_session,
-                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}"
-                )
+                self.short_contracts_prev = s_ct if s_ct > 0 else base_qty
+                await send_tg_message(self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}")
 
+            self.save_state()
             await self.audit_and_sync_all_orders()
+
+    # ============================ REOPEN ============================
 
     async def reopen_winner_position(self, current_price, winner_side):
         async with self.exec_lock:
             triggered_step = self.long_loser_step if winner_side == 'LONG' else self.short_loser_step
-            step_desc = f"Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
-            direction_text = "BUY" if winner_side == 'LONG' else "SELL"
+            step_desc = "Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
 
-            logger.info(f"🎉 [{SYMBOL_DISPLAY}] Тейк-профит {winner_side} ({step_desc}) исполнен! Переоткрытие...")
+            # 💡 Захватываем ID TP ДО сброса (для корректного PnL)
+            captured_tp_id = self.long_tp_order_id if winner_side == 'LONG' else self.short_tp_order_id
 
+            # 🔒 Сброс state ДО отправки маркета (защита от двойного срабатывания)
+            if winner_side == 'LONG':
+                self.long_tp_order_id = None
+                self.long_contracts_prev = 0
+                self.long_loser_step = 0
+                self.initial_long_entry = 0
+            else:
+                self.short_tp_order_id = None
+                self.short_contracts_prev = 0
+                self.short_loser_step = 0
+                self.initial_short_entry = 0
+            self.save_state()
+
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc}) исполнен. Переоткрытие...")
             qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
 
-            actual_entry = 0.0
-            actual_contracts = 0.0
-
-            # Сбрасываем ID старого тейка перед переоткрытием
-            if winner_side == 'LONG':
-                self.long_tp_order_id = None
-            else:
-                self.short_tp_order_id = None
-
-            for attempt in range(3):
+            success = False
+            for attempt in range(5):
                 try:
-                    await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
-                    actual_entry, actual_contracts = await self.get_actual_position_entry_price(winner_side)
-                    if actual_entry > 0:
+                    await self.exchange.create_order(SYMBOL, 'MARKET', side, qty,
+                                                     params={'positionSide': winner_side})
+                    await asyncio.sleep(0.8)
+                    entry, contracts = await self.get_actual_position_entry_price(winner_side)
+                    if entry > 0 and contracts > 0:
+                        if winner_side == 'LONG':
+                            self.long_entry_price = entry
+                            self.initial_long_entry = entry
+                            self.long_contracts_prev = contracts
+                        else:
+                            self.short_entry_price = entry
+                            self.initial_short_entry = entry
+                            self.short_contracts_prev = contracts
+                        self.save_state()
+                        success = True
+
+                        details = await self.fetch_tp_pnl(captured_tp_id)
+                        pnl_pct = (details['net'] / BASE_ORDER_USDC * 100.0) if BASE_ORDER_USDC > 0 else 0.0
+                        await send_tg_message(self.http_session,
+                            f"✅ <b>ТЕЙК-ПРОФИТ ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                            f"Направление: {winner_side}\n"
+                            f"💰 Net PnL: <b>{details['net']:+.2f} USDC ({pnl_pct:+.2f}%)</b>\n"
+                            f"📊 Gross: {details['gross']:+.2f} | Fee: {details['fee']:.4f}\n"
+                            f"💳 Баланс: {details['balance']:.2f} USDC\n"
+                            f"🔄 Новый вход: ${entry:,.2f} | Объём: {contracts}")
                         break
+                    await asyncio.sleep(1.0)
                 except Exception as e:
-                    logger.warning(f"⚠️ Попытка {attempt+1} переоткрытия {winner_side} не удалась: {e}")
-                    await asyncio.sleep(1.5)
+                    logger.warning(f"⚠️ reopen {winner_side} try#{attempt+1}: {e}")
+                    await asyncio.sleep(1.5 + attempt * 0.5)
 
-            if actual_entry > 0:
-                if winner_side == 'LONG':
-                    self.long_entry_price = actual_entry
-                    self.initial_long_entry = actual_entry
-                    self.long_contracts_prev = actual_contracts
-                    self.long_loser_step = 0
-                else:
-                    self.short_entry_price = actual_entry
-                    self.initial_short_entry = actual_entry
-                    self.short_contracts_prev = actual_contracts
-                    self.short_loser_step = 0
+            if not success:
+                logger.error(f"❌ Не удалось переоткрыть {winner_side} после 5 попыток! Синхронизация с биржей...")
+                try:
+                    positions = await self.exchange.fetch_positions([SYMBOL])
+                    pos = next((p for p in positions if p['side'] == winner_side.lower()
+                                and float(p['contracts']) > 0), None)
+                    if pos:
+                        contracts = float(pos['contracts'])
+                        avg = float(pos['entryPrice'])
+                        inferred = self._infer_step_from_position(contracts, avg)
+                        if winner_side == 'LONG':
+                            self.long_contracts_prev = contracts
+                            self.long_entry_price = avg
+                            self.long_loser_step = inferred
+                            self.initial_long_entry = self._infer_initial_entry(avg, inferred)
+                        else:
+                            self.short_contracts_prev = contracts
+                            self.short_entry_price = avg
+                            self.short_loser_step = inferred
+                            self.initial_short_entry = self._infer_initial_entry(avg, inferred)
+                        logger.warning(f"🔁 {winner_side} позиция восстановлена: {contracts} @ ${avg:,.2f}")
+                except Exception as e:
+                    logger.error(f"⚠️ sync after failed reopen: {e}")
+                self.save_state()
 
-                details = await self.fetch_trade_and_pnl_details()
-                net_pnl = details['net']
-                gross_pnl = details['gross']
-                fee_total = details['fee']
-                wallet_balance = details['balance']
-                
-                pnl_percent = (net_pnl / BASE_ORDER_USDC) * 100.0 if BASE_ORDER_USDC > 0 else 0.0
-
-                tg_msg = (
-                    f"✅ <b>ТЕЙК-ПРОФИТ! ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
-                    f"Направление: {direction_text}\n"
-                    f"💰 PnL: <b>{net_pnl:+.2f} USDC ({pnl_percent:+.2f}%)</b>\n"
-                    f"📈 Выход: {current_price:,.2f} | Gross: {gross_pnl:+.2f} USDC\n"
-                    f"💸 Комиссия всего: {fee_total:.4f} USDC\n"
-                    f"💳 Баланс: {wallet_balance:.2f} USDC\n"
-                    f"🔄 <b>Новый вход:</b> ${actual_entry:,.2f} | Объем: {actual_contracts}"
-                )
-                await send_tg_message(self.http_session, tg_msg)
-            else:
-                logger.error(f"❌ Не удалось переоткрыть позицию {winner_side} после 3 попыток!")
+                await send_tg_message(self.http_session,
+                    f"⚠️ <b>[{SYMBOL_DISPLAY}] Не удалось переоткрыть {winner_side}</b>\n"
+                    f"Синхронизация выполнена. Проверьте позицию вручную.")
 
             await self.audit_and_sync_all_orders()
+
+    # ============================ MAIN LOOP ============================
 
     async def main_loop(self):
         logger.info(f"✅ Главный цикл мониторинга для {SYMBOL_DISPLAY} запущен.")
@@ -502,12 +695,14 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. ТЕЙК-ПРОФИТ LONG ---
-                if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
+                # --- 1. TP LONG ---
+                if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev - 1e-9:
                     drop_diff = self.long_contracts_prev - long_contracts
-                    if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
+                    is_full_close = (long_contracts == 0) or (long_contracts / self.long_contracts_prev < 0.05)
+
+                    if is_full_close and (current_time - self.last_long_tp_time > 5.0):
                         self.last_long_tp_time = current_time
-                        logger.info("Исполнен тейк-профит по LONG!")
+                        logger.info(f"✅ LONG TP (полное закрытие, drop={drop_diff:.6f})")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -518,13 +713,18 @@ class CCXTUsdcHedgeBot:
                         await self.reopen_winner_position(float(ticker['last']), 'LONG')
                         await asyncio.sleep(1)
                         continue
+                    else:
+                        logger.info(f"ℹ️ LONG частичный TP: {self.long_contracts_prev:.6f} → {long_contracts:.6f}")
+                        self.long_contracts_prev = long_contracts
 
-                # --- 2. ТЕЙК-ПРОФИТ SHORT ---
-                if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
+                # --- 2. TP SHORT ---
+                if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev - 1e-9:
                     drop_diff = self.short_contracts_prev - short_contracts
-                    if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
+                    is_full_close = (short_contracts == 0) or (short_contracts / self.short_contracts_prev < 0.05)
+
+                    if is_full_close and (current_time - self.last_short_tp_time > 5.0):
                         self.last_short_tp_time = current_time
-                        logger.info("Исполнен тейк-профит по SHORT!")
+                        logger.info(f"✅ SHORT TP (полное закрытие, drop={drop_diff:.6f})")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
@@ -535,15 +735,18 @@ class CCXTUsdcHedgeBot:
                         await self.reopen_winner_position(float(ticker['last']), 'SHORT')
                         await asyncio.sleep(1)
                         continue
+                    else:
+                        logger.info(f"ℹ️ SHORT частичный TP: {self.short_contracts_prev:.6f} → {short_contracts:.6f}")
+                        self.short_contracts_prev = short_contracts
 
                 # --- 3. Усреднение LONG ---
-                if long_contracts > self.long_contracts_prev and self.long_contracts_prev > 0:
+                if long_contracts > self.long_contracts_prev + 1e-9 and self.long_contracts_prev > 0:
                     async with self.exec_lock:
                         self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
                         self.long_contracts_prev = long_contracts
                         if long_pos:
                             self.long_entry_price = float(long_pos['entryPrice'])
-
+                        self.save_state()
                         msg = f"🎯 🟢 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.long_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
                         logger.info(msg)
                         await send_tg_message(self.http_session, msg)
@@ -551,13 +754,13 @@ class CCXTUsdcHedgeBot:
                         continue
 
                 # --- 4. Усреднение SHORT ---
-                if short_contracts > self.short_contracts_prev and self.short_contracts_prev > 0:
+                if short_contracts > self.short_contracts_prev + 1e-9 and self.short_contracts_prev > 0:
                     async with self.exec_lock:
                         self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
                         self.short_contracts_prev = short_contracts
                         if short_pos:
                             self.short_entry_price = float(short_pos['entryPrice'])
-
+                        self.save_state()
                         msg = f"🎯 🔻 [{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ {self.short_loser_step}/{GRID_LEVELS} ВЫПОЛНЕНО!"
                         logger.info(msg)
                         await send_tg_message(self.http_session, msg)
@@ -586,7 +789,9 @@ class CCXTUsdcHedgeBot:
                 await self.safe_close_exchange()
                 await asyncio.sleep(5)
 
+
 bot = CCXTUsdcHedgeBot()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -598,12 +803,15 @@ async def lifespan(app: FastAPI):
     if bot.exchange:
         await bot.exchange.close()
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 @app.get("/health")
 async def root():
     return {"status": "ok", "symbol": SYMBOL_DISPLAY}
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
