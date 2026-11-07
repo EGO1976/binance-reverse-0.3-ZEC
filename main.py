@@ -197,7 +197,6 @@ class CCXTUsdcHedgeBot:
         return 0.0, 0.0
 
     async def fetch_trade_and_pnl_details(self):
-        """Собирает детальные данные по PnL, комиссиям и текущему балансу USDC"""
         for attempt in range(5):
             await asyncio.sleep(1.0)
             try:
@@ -438,7 +437,6 @@ class CCXTUsdcHedgeBot:
             actual_entry = 0.0
             actual_contracts = 0.0
 
-            # Повторные попытки с защитой от сетевых сбоев
             for attempt in range(3):
                 try:
                     await self.exchange.create_order(SYMBOL, 'MARKET', side, qty, params={'positionSide': winner_side})
@@ -489,7 +487,6 @@ class CCXTUsdcHedgeBot:
         while self.is_running:
             try:
                 open_orders = await self.exchange.fetch_open_orders(SYMBOL)
-                open_order_ids = set(str(o['id']) for o in open_orders)
                 positions = await self.exchange.fetch_positions([SYMBOL])
 
                 long_pos = next((p for p in positions if p['side'] == 'long' and float(p['contracts']) > 0), None)
@@ -498,10 +495,14 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. TP LONG ---
-                if self.long_tp_order_id and self.long_tp_order_id not in open_order_ids:
-                    if long_contracts < self.long_contracts_prev:
-                        self.long_tp_order_id = None
+                # --- 1. Проверка срабатывания ТЕЙК-ПРОФИТА LONG (если контракты резко уменьшились) ---
+                if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
+                    # Проверяем, действительно ли это закрытие по тейку (позиция закрылась либо уменьшилась до базы/нуля)
+                    # Если контракты стали меньше предыдущего значения больше чем на 10% (или обнулились)
+                    drop_diff = self.long_contracts_prev - long_contracts
+                    if drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0:
+                        logger.info(📉 Обнаружено закрытие/исполнение тейка по LONG!)
+                        # Отменяем старые ордера этой ветки
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
                                 try:
@@ -510,13 +511,14 @@ class CCXTUsdcHedgeBot:
                                     pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
                         await self.reopen_winner_position(float(ticker['last']), 'LONG')
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1)
                         continue
 
-                # --- 2. TP SHORT ---
-                if self.short_tp_order_id and self.short_tp_order_id not in open_order_ids:
-                    if short_contracts < self.short_contracts_prev:
-                        self.short_tp_order_id = None
+                # --- 2. Проверка срабатывания ТЕЙК-ПРОФИТА SHORT ---
+                if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
+                    drop_diff = self.short_contracts_prev - short_contracts
+                    if drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0:
+                        logger.info(📉 Обнаружено закрытие/исполнение тейка по SHORT!)
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
                                 try:
@@ -525,11 +527,11 @@ class CCXTUsdcHedgeBot:
                                     pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
                         await self.reopen_winner_position(float(ticker['last']), 'SHORT')
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(1)
                         continue
 
-                # --- 3. Grid Averaging LONG ---
-                if long_contracts > self.long_contracts_prev:
+                # --- 3. Проверка срабатывания усреднения LONG (контракты выросли) ---
+                if long_contracts > self.long_contracts_prev and self.long_contracts_prev > 0:
                     async with self.exec_lock:
                         self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
                         self.long_contracts_prev = long_contracts
@@ -542,8 +544,8 @@ class CCXTUsdcHedgeBot:
                         await self.audit_and_sync_all_orders()
                         continue
 
-                # --- 4. Grid Averaging SHORT ---
-                if short_contracts > self.short_contracts_prev:
+                # --- 4. Проверка срабатывания усреднения SHORT (контракты выросли) ---
+                if short_contracts > self.short_contracts_prev and self.short_contracts_prev > 0:
                     async with self.exec_lock:
                         self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
                         self.short_contracts_prev = short_contracts
@@ -556,9 +558,11 @@ class CCXTUsdcHedgeBot:
                         await self.audit_and_sync_all_orders()
                         continue
 
+                # Обновляем предыдущие значения для следующего тика
                 self.long_contracts_prev = long_contracts
                 self.short_contracts_prev = short_contracts
 
+                # Регулярная сверка стакана (уважает ручной перенос ордеров)
                 await self.audit_and_sync_all_orders()
 
             except Exception as e:
