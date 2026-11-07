@@ -208,14 +208,12 @@ class CCXTUsdcHedgeBot:
 
                 for trade in reversed(trades):
                     info = trade.get('info', {})
-                    # Извлекаем реализованный PnL и комиссию из полей Binance Futures ордера
                     pnl = float(info.get('realizedPnl', 0.0))
                     fee_cost = float(trade.get('fee', {}).get('cost', 0.0))
 
                     if pnl != 0.0 or fee_cost != 0.0:
                         realized_pnl += pnl
                         fee_paid += abs(fee_cost)
-                        # Берем только последние закрывающие сделки текущего цикла
                         break
 
                 net_profit = realized_pnl - fee_paid
@@ -374,7 +372,12 @@ class CCXTUsdcHedgeBot:
                 self.initial_long_entry = self.long_entry_price
                 self.long_contracts_prev = long_contracts
                 logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {long_contracts} | ТВХ: ${self.long_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] LONG ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.long_entry_price:,.2f} | Объем: {long_contracts}"
+                )
             else:
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден! Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
                 l_entry, l_contracts = await self.get_actual_position_entry_price('LONG')
@@ -382,6 +385,10 @@ class CCXTUsdcHedgeBot:
                 self.initial_long_entry = self.long_entry_price
                 self.long_contracts_prev = l_contracts if l_contracts > 0 else base_qty
                 self.long_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}"
+                )
 
             # --- SHORT ---
             if short_pos:
@@ -390,7 +397,12 @@ class CCXTUsdcHedgeBot:
                 self.initial_short_entry = self.short_entry_price
                 self.short_contracts_prev = short_contracts
                 logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {short_contracts} | ТВХ: ${self.short_entry_price:,.2f}")
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT ПОДХВАЧЕН С БИРЖИ</b>\nЦена входа: ${self.short_entry_price:,.2f} | Объем: {short_contracts}"
+                )
             else:
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден! Открываем базу...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
                 s_entry, s_contracts = await self.get_actual_position_entry_price('SHORT')
@@ -398,6 +410,10 @@ class CCXTUsdcHedgeBot:
                 self.initial_short_entry = self.short_entry_price
                 self.short_contracts_prev = s_contracts if s_contracts > 0 else base_qty
                 self.short_loser_step = 0
+                await send_tg_message(
+                    self.http_session,
+                    f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}"
+                )
 
             await self.audit_and_sync_all_orders()
 
@@ -474,7 +490,7 @@ class CCXTUsdcHedgeBot:
                 long_contracts = float(long_pos['contracts']) if long_pos else 0.0
                 short_contracts = float(short_pos['contracts']) if short_pos else 0.0
 
-                # --- 1. ТЕЙК-ПРОФИТ LONG (с защитой от дублей по тайм-ауту 5 сек) ---
+                # --- 1. ТЕЙК-ПРОФИТ LONG ---
                 if self.long_contracts_prev > 0 and long_contracts < self.long_contracts_prev:
                     drop_diff = self.long_contracts_prev - long_contracts
                     if (drop_diff >= (self.long_contracts_prev * 0.5) or long_contracts == 0) and (current_time - self.last_long_tp_time > 5.0):
@@ -491,7 +507,7 @@ class CCXTUsdcHedgeBot:
                         await asyncio.sleep(1)
                         continue
 
-                # --- 2. ТЕЙК-ПРОФИТ SHORT (с защитой от дублей по тайм-ауту 5 сек) ---
+                # --- 2. ТЕЙК-ПРОФИТ SHORT ---
                 if self.short_contracts_prev > 0 and short_contracts < self.short_contracts_prev:
                     drop_diff = self.short_contracts_prev - short_contracts
                     if (drop_diff >= (self.short_contracts_prev * 0.5) or short_contracts == 0) and (current_time - self.last_short_tp_time > 5.0):
