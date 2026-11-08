@@ -18,7 +18,10 @@ SYMBOL = SYMBOL_RAW
 SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 
 LEVERAGE = int(os.getenv('LEVERAGE', 50))
-BASE_ORDER_USDC = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
+
+# 💡 Раздельные объёмы для LONG и SHORT
+BASE_ORDER_USDC_LONG = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
+BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 100.0))
 
 GRID_LEVELS = 3
 VISIBLE_GRID_LEVELS = 1
@@ -27,6 +30,13 @@ STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
 AUDIT_INTERVAL = float(os.getenv('AUDIT_INTERVAL', 30.0))
 
 TAKER_FEE_RATE = float(os.getenv('TAKER_FEE_RATE', 0.0004))  # 0.04%
+
+SIX_DAYS_MS = 6 * 24 * 3600 * 1000
+
+
+def get_base_usdc(side: str) -> float:
+    """Размер базового ордера для стороны."""
+    return BASE_ORDER_USDC_LONG if side == 'LONG' else BASE_ORDER_USDC_SHORT
 
 
 def get_grid_step_percent(step: int) -> float:
@@ -39,14 +49,15 @@ def get_grid_step_percent(step: int) -> float:
     return 15.0
 
 
-def get_step_usdc_volume(step: int) -> float:
+def get_step_usdc_volume(step: int, side: str) -> float:
+    base = get_base_usdc(side)
     if step <= 1:
-        return float(BASE_ORDER_USDC)
+        return base
     elif step == 2:
-        return float(BASE_ORDER_USDC * 2.0)
+        return base * 2.0
     elif step == 3:
-        return float(BASE_ORDER_USDC * 4.0)
-    return float(BASE_ORDER_USDC * 4.0)
+        return base * 4.0
+    return base * 4.0
 
 
 WINNER_TAKE_PROFIT_PCT = 0.5
@@ -140,14 +151,14 @@ class CCXTUsdcHedgeBot:
         except Exception as e:
             logger.error(f"⚠️ load_state: {e}")
 
-    def _infer_step_from_position(self, contracts: float, avg_entry: float) -> int:
-        """Определяет шаг по объёму позиции.
-        Фактические объёмы: base(1x) + avg1(1x) + avg2(2x) + avg3(4x).
-        Значит after step: ratio contracts/(BASE/avg) = 1 / 2 / 4 / 8.
+    def _infer_step_from_position(self, contracts: float, avg_entry: float, side: str) -> int:
+        """Определяет шаг по объёму позиции для конкретной стороны.
+        Объёмы: base(1x) + avg1(1x) + avg2(2x) + avg3(4x) → ratio 1/2/4/8.
         Пороги — середины: 1.5 / 3.0 / 6.0."""
         if avg_entry <= 0 or contracts <= 0:
             return 0
-        base_qty = BASE_ORDER_USDC / avg_entry
+        base_usdc = get_base_usdc(side)
+        base_qty = base_usdc / avg_entry
         if base_qty <= 0:
             return 0
         ratio = contracts / base_qty
@@ -214,7 +225,8 @@ class CCXTUsdcHedgeBot:
         except Exception:
             pass
 
-        logger.info(f"✅ Инициализация выполнена для {SYMBOL_DISPLAY}. Плечо {LEVERAGE}x CROSSED (Hedge Mode, USDC).")
+        logger.info(f"✅ Инициализация выполнена для {SYMBOL_DISPLAY}. Плечо {LEVERAGE}x CROSSED. "
+                    f"LONG=${BASE_ORDER_USDC_LONG} | SHORT=${BASE_ORDER_USDC_SHORT}")
 
     # ============================ HELPERS ============================
 
@@ -258,7 +270,7 @@ class CCXTUsdcHedgeBot:
         return qty
 
     async def get_actual_position_entry_price(self, position_side):
-        # 3 попытки × 0.3с = максимум 0.9с (было 5 × 0.5 = 2.5с)
+        # ⚡ 3 попытки × 0.15с = макс 0.45с
         for _ in range(3):
             try:
                 positions = await self.exchange.fetch_positions([SYMBOL])
@@ -267,13 +279,13 @@ class CCXTUsdcHedgeBot:
                     return float(pos['entryPrice']), float(pos['contracts'])
             except Exception as e:
                 logger.error(f"Ошибка получения позиции {position_side}: {e}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
         return 0.0, 0.0
 
     # ============================ PnL ============================
 
     async def _fetch_trades_by_order(self, order_id, retries=4):
-        """userTrades по orderId. Прямой REST Binance. retries=4 → max 2с."""
+        """userTrades по orderId. Прямой REST Binance."""
         if not order_id:
             return []
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
@@ -293,21 +305,52 @@ class CCXTUsdcHedgeBot:
         return []
 
     async def _fetch_trades_since(self, start_ms, retries=3):
-        """userTrades ТОЛЬКО с startTime, БЕЗ endTime — обход 7-дневного лимита."""
+        """userTrades с startTime. Дробит на 6-дневные окна — обход
+        лимита Binance (startTime + endTime > 7д → ошибка -1127)."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
-        for attempt in range(retries):
-            try:
-                trades = await self.exchange.fapiPrivateGetUserTrades({
-                    'symbol': raw_symbol,
-                    'startTime': int(start_ms),
-                    'limit': 1000,
-                })
-                if isinstance(trades, list):
-                    return trades
-            except Exception as e:
-                logger.debug(f"userTrades since={start_ms} попытка {attempt+1}: {e}")
-            await asyncio.sleep(0.5)
-        return []
+        now_ms = int(time.time() * 1000)
+        span = now_ms - start_ms
+
+        if span <= SIX_DAYS_MS:
+            for attempt in range(retries):
+                try:
+                    trades = await self.exchange.fapiPrivateGetUserTrades({
+                        'symbol': raw_symbol,
+                        'startTime': int(start_ms),
+                        'limit': 1000,
+                    })
+                    if isinstance(trades, list):
+                        logger.debug(f"userTrades since={start_ms}: {len(trades)} шт (1 запрос)")
+                        return trades
+                except Exception as e:
+                    logger.debug(f"userTrades since={start_ms} попытка {attempt+1}: {e}")
+                await asyncio.sleep(0.5)
+            return []
+
+        all_trades = []
+        cursor = start_ms
+        chunks = 0
+        while cursor < now_ms:
+            chunk_end = min(cursor + SIX_DAYS_MS, now_ms)
+            chunks += 1
+            for attempt in range(retries):
+                try:
+                    trades = await self.exchange.fapiPrivateGetUserTrades({
+                        'symbol': raw_symbol,
+                        'startTime': int(cursor),
+                        'endTime': int(chunk_end),
+                        'limit': 1000,
+                    })
+                    if isinstance(trades, list):
+                        all_trades.extend(trades)
+                        break
+                except Exception as e:
+                    logger.debug(f"userTrades chunk {cursor}-{chunk_end} попытка {attempt+1}: {e}")
+                    await asyncio.sleep(0.5)
+            cursor = chunk_end
+
+        logger.debug(f"userTrades span={span // 3600000}ч → {chunks} chunks, {len(all_trades)} trades")
+        return all_trades
 
     async def _fetch_commission_income(self, start_ms, end_ms, retries=2):
         """Fallback COMMISSION через /fapi/v1/income, 6-дневные окна."""
@@ -318,7 +361,7 @@ class CCXTUsdcHedgeBot:
         end_ms = int(end_ms)
 
         while cursor < end_ms:
-            chunk_end = min(cursor + 6 * 24 * 3600 * 1000, end_ms)
+            chunk_end = min(cursor + SIX_DAYS_MS, end_ms)
             for attempt in range(retries):
                 try:
                     income = await self.exchange.fapiPrivateGetIncome({
@@ -448,6 +491,22 @@ class CCXTUsdcHedgeBot:
                             logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
             else:
                 logger.warning("⚠️ Entry trades не найдены за 30д")
+                # 💡 диагностика: пробный запрос за 6 дней
+                try:
+                    probe = await self.exchange.fapiPrivateGetUserTrades({
+                        'symbol': SYMBOL_DISPLAY.replace('/', ''),
+                        'startTime': int(earliest_tp_ms - SIX_DAYS_MS),
+                        'limit': 5,
+                    })
+                    if isinstance(probe, list):
+                        logger.warning(f"  → probe: {len(probe)} trades в окне 6д")
+                        for t in probe[:3]:
+                            logger.warning(f"     positionSide={t.get('positionSide')} side={t.get('side')} "
+                                           f"time={t.get('time')} commission={t.get('commission')}")
+                    else:
+                        logger.warning(f"  → probe вернул не-список: {type(probe)}")
+                except Exception as e:
+                    logger.warning(f"  → probe failed: {e}")
 
             if result['entry_fee'] == 0 and fallback_entry_notional > 0:
                 estimate = fallback_entry_notional * TAKER_FEE_RATE
@@ -581,7 +640,7 @@ class CCXTUsdcHedgeBot:
                     if grids_long:
                         gid, gobj = list(grids_long.items())[0]
                         expected_qty = self.calculate_qty_for_usdc(
-                            get_step_usdc_volume(next_step), float(gobj['price']) or l_entry)
+                            get_step_usdc_volume(next_step, 'LONG'), float(gobj['price']) or l_entry)
                         if size_mismatch(gobj, expected_qty):
                             try:
                                 await self.exchange.cancel_order(gid, SYMBOL)
@@ -599,7 +658,8 @@ class CCXTUsdcHedgeBot:
                     if not grids_long:
                         dist = get_grid_step_percent(next_step)
                         gprice = self.round_price(self.initial_long_entry * (1.0 - (dist / 100.0)))
-                        gqty = self.calculate_qty_for_usdc(get_step_usdc_volume(next_step), gprice)
+                        gqty = self.calculate_qty_for_usdc(
+                            get_step_usdc_volume(next_step, 'LONG'), gprice)
                         try:
                             n = await self.exchange.create_order(
                                 SYMBOL, 'LIMIT', 'buy', gqty, gprice,
@@ -647,7 +707,7 @@ class CCXTUsdcHedgeBot:
                     if grids_short:
                         gid, gobj = list(grids_short.items())[0]
                         expected_qty = self.calculate_qty_for_usdc(
-                            get_step_usdc_volume(next_step), float(gobj['price']) or s_entry)
+                            get_step_usdc_volume(next_step, 'SHORT'), float(gobj['price']) or s_entry)
                         if size_mismatch(gobj, expected_qty):
                             try:
                                 await self.exchange.cancel_order(gid, SYMBOL)
@@ -664,7 +724,8 @@ class CCXTUsdcHedgeBot:
                     if not grids_short:
                         dist = get_grid_step_percent(next_step)
                         gprice = self.round_price(self.initial_short_entry * (1.0 + (dist / 100.0)))
-                        gqty = self.calculate_qty_for_usdc(get_step_usdc_volume(next_step), gprice)
+                        gqty = self.calculate_qty_for_usdc(
+                            get_step_usdc_volume(next_step, 'SHORT'), gprice)
                         try:
                             n = await self.exchange.create_order(
                                 SYMBOL, 'LIMIT', 'sell', gqty, gprice,
@@ -706,9 +767,9 @@ class CCXTUsdcHedgeBot:
             if long_pos:
                 contracts = float(long_pos['contracts'])
                 avg = float(long_pos['entryPrice'])
-                inferred_step = self._infer_step_from_position(contracts, avg)
+                inferred_step = self._infer_step_from_position(contracts, avg, 'LONG')
 
-                base_qty_for_log = BASE_ORDER_USDC / avg if avg > 0 else 0
+                base_qty_for_log = BASE_ORDER_USDC_LONG / avg if avg > 0 else 0
                 ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
 
                 if self.initial_long_entry > 0 and self.long_loser_step == inferred_step:
@@ -728,8 +789,8 @@ class CCXTUsdcHedgeBot:
             else:
                 self.long_loser_step = 0
                 self.initial_long_entry = 0.0
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден. Открываем базу...")
-                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден. Открываем базу ${BASE_ORDER_USDC_LONG}...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC_LONG, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
                 l_entry, l_ct = await self.get_actual_position_entry_price('LONG')
                 self.long_entry_price = l_entry if l_entry > 0 else current_price
@@ -742,9 +803,9 @@ class CCXTUsdcHedgeBot:
             if short_pos:
                 contracts = float(short_pos['contracts'])
                 avg = float(short_pos['entryPrice'])
-                inferred_step = self._infer_step_from_position(contracts, avg)
+                inferred_step = self._infer_step_from_position(contracts, avg, 'SHORT')
 
-                base_qty_for_log = BASE_ORDER_USDC / avg if avg > 0 else 0
+                base_qty_for_log = BASE_ORDER_USDC_SHORT / avg if avg > 0 else 0
                 ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
 
                 if self.initial_short_entry > 0 and self.short_loser_step == inferred_step:
@@ -764,8 +825,8 @@ class CCXTUsdcHedgeBot:
             else:
                 self.short_loser_step = 0
                 self.initial_short_entry = 0.0
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден. Открываем базу...")
-                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден. Открываем базу ${BASE_ORDER_USDC_SHORT}...")
+                base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC_SHORT, current_price)
                 await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
                 s_entry, s_ct = await self.get_actual_position_entry_price('SHORT')
                 self.short_entry_price = s_entry if s_entry > 0 else current_price
@@ -791,10 +852,12 @@ class CCXTUsdcHedgeBot:
             captured_avg = self.long_entry_price if winner_side == 'LONG' else self.short_entry_price
             captured_ct = self.long_contracts_prev if winner_side == 'LONG' else self.short_contracts_prev
 
+            base_usdc_for_side = get_base_usdc(winner_side)
+
             if not captured_tp_id:
                 logger.warning(f"⚠️ captured_tp_id is None для {winner_side}!")
 
-            fallback_notional = captured_avg * captured_ct if (captured_avg > 0 and captured_ct > 0) else BASE_ORDER_USDC
+            fallback_notional = captured_avg * captured_ct if (captured_avg > 0 and captured_ct > 0) else base_usdc_for_side
 
             if winner_side == 'LONG':
                 self.long_tp_order_id = None
@@ -811,7 +874,7 @@ class CCXTUsdcHedgeBot:
             self.save_state()
 
             logger.info(f"🎉 [{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc}) исполнен. Переоткрытие...")
-            qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC, current_price)
+            qty = self.calculate_qty_for_usdc(base_usdc_for_side, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
 
             success = False
@@ -826,7 +889,8 @@ class CCXTUsdcHedgeBot:
                         if not new_order_id and isinstance(new_order.get('info'), dict):
                             new_order_id = new_order['info'].get('orderId')
 
-                    await asyncio.sleep(0.5)
+                    # ⚡ Минимальная пауза — TP и сетка выставляются в течение ~1 сек
+                    await asyncio.sleep(0.15)
                     entry, contracts = await self.get_actual_position_entry_price(winner_side)
                     if entry > 0 and contracts > 0:
                         if winner_side == 'LONG':
@@ -840,10 +904,10 @@ class CCXTUsdcHedgeBot:
                         self.save_state()
                         success = True
 
-                        # ⚡ СНАЧАЛА выставляем TP и сетку — быстро (~2-3 сек от market)
+                        # ⚡ СНАЧАЛА TP + сетка — быстро
                         await self.audit_and_sync_all_orders()
 
-                        # 📊 ПОТОМ считаем PnL и отправляем TG (не блокирует торговлю)
+                        # 📊 ПОТОМ PnL и TG (не блокирует торговлю)
                         new_entry_notional = entry * contracts
                         details = await self.fetch_tp_pnl(
                             captured_tp_id,
@@ -852,7 +916,7 @@ class CCXTUsdcHedgeBot:
                             new_entry_order_id=new_order_id,
                             new_entry_notional=new_entry_notional,
                         )
-                        pnl_pct = (details['net'] / BASE_ORDER_USDC * 100.0) if BASE_ORDER_USDC > 0 else 0.0
+                        pnl_pct = (details['net'] / base_usdc_for_side * 100.0) if base_usdc_for_side > 0 else 0.0
 
                         fee_note = ""
                         if details['source'] == 'no_tp_trades':
@@ -876,10 +940,10 @@ class CCXTUsdcHedgeBot:
                             f"🔄 Новый вход: ${entry:,.2f} | Объём: {contracts}\n"
                             f"💸 Fee нового входа: {details['new_entry_fee']:.4f}{new_fee_note}")
                         break
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.warning(f"⚠️ reopen {winner_side} try#{attempt+1}: {e}")
-                    await asyncio.sleep(1.5 + attempt * 0.5)
+                    await asyncio.sleep(1.0 + attempt * 0.3)
 
             if not success:
                 logger.error(f"❌ Не удалось переоткрыть {winner_side} после 5 попыток! Синхронизация...")
@@ -890,7 +954,7 @@ class CCXTUsdcHedgeBot:
                     if pos:
                         contracts = float(pos['contracts'])
                         avg = float(pos['entryPrice'])
-                        inferred = self._infer_step_from_position(contracts, avg)
+                        inferred = self._infer_step_from_position(contracts, avg, winner_side)
                         if winner_side == 'LONG':
                             self.long_contracts_prev = contracts
                             self.long_entry_price = avg
@@ -910,7 +974,6 @@ class CCXTUsdcHedgeBot:
                     f"⚠️ <b>[{SYMBOL_DISPLAY}] Не удалось переоткрыть {winner_side}</b>\n"
                     f"Синхронизация выполнена. Проверьте позицию вручную.")
 
-                # даже при неудаче — попытаться выставить TP и сетку
                 await self.audit_and_sync_all_orders()
 
     # ============================ MAIN LOOP ============================
