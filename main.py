@@ -23,7 +23,6 @@ BASE_ORDER_USDC_LONG = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
 BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 100.0))
 
 GRID_LEVELS = 3
-VISIBLE_GRID_LEVELS = 1
 
 STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
 AUDIT_INTERVAL = float(os.getenv('AUDIT_INTERVAL', 30.0))
@@ -279,6 +278,33 @@ class CCXTUsdcHedgeBot:
             await asyncio.sleep(0.15)
         return 0.0, 0.0
 
+    async def _cancel_all_orders_for_side(self, side: str):
+        """Свежий fetch + отмена ВСЕХ открытых ордеров для стороны (TP + все сетки).
+        Гарантирует чистый старт для новой позиции после TP."""
+        try:
+            fresh_orders = await self.exchange.fetch_open_orders(SYMBOL)
+        except Exception as e:
+            logger.warning(f"⚠️ fetch_open_orders для cancel_all ({side}): {e}")
+            return
+
+        canceled = 0
+        for o in fresh_orders:
+            ps = str(o.get('info', {}).get('positionSide', '')).upper()
+            if ps != side:
+                continue
+            oid = str(o['id'])
+            try:
+                await self.exchange.cancel_order(oid, SYMBOL)
+                canceled += 1
+                logger.info(f"🧹 Отменён {ps} ордер {oid} (price={o.get('price')} size={o.get('amount')}) перед новым входом")
+            except Exception as e:
+                logger.warning(f"⚠️ cancel {oid}: {e}")
+
+        if canceled > 0:
+            logger.info(f"✅ Отменено {canceled} ордер(ов) {side} перед реопеном")
+        else:
+            logger.info(f"ℹ️ Нечего отменять для {side} (нет открытых ордеров)")
+
     # ============================ PnL ============================
 
     async def _fetch_trades_by_order(self, order_id, retries=4, start_hint_ms=None):
@@ -492,21 +518,6 @@ class CCXTUsdcHedgeBot:
                             logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
             else:
                 logger.warning("⚠️ Entry trades не найдены за 30д")
-                try:
-                    probe = await self.exchange.fapiPrivateGetUserTrades({
-                        'symbol': SYMBOL_DISPLAY.replace('/', ''),
-                        'startTime': int(earliest_tp_ms - SIX_DAYS_MS),
-                        'limit': 5,
-                    })
-                    if isinstance(probe, list):
-                        logger.warning(f"  → probe: {len(probe)} trades в окне 6д")
-                        for t in probe[:3]:
-                            logger.warning(f"     positionSide={t.get('positionSide')} side={t.get('side')} "
-                                           f"time={t.get('time')} commission={t.get('commission')}")
-                    else:
-                        logger.warning(f"  → probe вернул не-список: {type(probe)}")
-                except Exception as e:
-                    logger.warning(f"  → probe failed: {e}")
 
             if result['entry_fee'] == 0 and fallback_entry_notional > 0:
                 estimate = fallback_entry_notional * TAKER_FEE_RATE
@@ -619,7 +630,9 @@ class CCXTUsdcHedgeBot:
 
     # ============================ AUDIT ============================
 
-    async def audit_and_sync_all_orders(self, open_orders=None, positions=None):
+    async def audit_and_sync_all_orders(self, open_orders=None, positions=None, mode="runtime"):
+        full_check = (mode == "deploy")
+
         try:
             if open_orders is None:
                 open_orders = await self.exchange.fetch_open_orders(SYMBOL)
@@ -645,7 +658,7 @@ class CCXTUsdcHedgeBot:
                     grids_short[str(o['id'])] = o
 
             SIZE_TOL = 0.03
-            PRICE_TOL = 0.003  # 0.3% для сверки цены сетки
+            PRICE_TOL = 0.003
 
             def size_mismatch(order, expected_qty):
                 try:
@@ -694,18 +707,30 @@ class CCXTUsdcHedgeBot:
                 if tp_long and size_mismatch(tp_long, l_contracts):
                     try:
                         await self.exchange.cancel_order(str(tp_long['id']), SYMBOL)
-                        logger.info(f"🔁 TP_LONG отменён: размер {tp_long.get('amount')} ≠ позиции {l_contracts}")
+                        logger.info(f"🔁 TP_LONG пересоздаётся: size {tp_long.get('amount')} ≠ позиции {l_contracts}")
                         tp_long = None
                         self.long_tp_order_id = None
                     except Exception as e:
                         logger.error(f"❌ cancel TP_LONG: {e}")
+
+                if full_check and tp_long:
+                    expected_tp = self.round_price(l_entry * (1.0 + WINNER_TAKE_PROFIT_PCT / 100.0))
+                    if price_mismatch(tp_long, expected_tp):
+                        try:
+                            await self.exchange.cancel_order(str(tp_long['id']), SYMBOL)
+                            logger.info(f"🔁 TP_LONG отменён (deploy): price {tp_long.get('price')} ≠ {expected_tp}")
+                            tp_long = None
+                            self.long_tp_order_id = None
+                        except Exception as e:
+                            logger.error(f"❌ cancel TP_LONG: {e}")
 
                 if tp_long:
                     new_id = str(tp_long['id'])
                     if self.long_tp_order_id != new_id:
                         logger.info(f"🟢 TP_LONG подхвачен (size={tp_long.get('amount')} @ ${float(tp_long['price']):,.2f})")
                     self.long_tp_order_id = new_id
-                elif not self.long_tp_order_id:
+                else:
+                    self.long_tp_order_id = None
                     tp_price = self.round_price(l_entry * (1.0 + (WINNER_TAKE_PROFIT_PCT / 100.0)))
                     try:
                         n = await self.exchange.create_order(
@@ -716,16 +741,15 @@ class CCXTUsdcHedgeBot:
                     except Exception as e:
                         logger.error(f"❌ create TP_LONG: {e}")
 
-                # 💡 Сетка от ТЕКУЩЕЙ СРЕДНЕЙ (l_entry), не от initial_long_entry
                 next_step = self.long_loser_step + 1
                 if next_step <= GRID_LEVELS:
                     dist = get_grid_step_percent(next_step)
                     gprice_expected = self.round_price(l_entry * (1.0 - (dist / 100.0)))
+                    expected_qty = self.calculate_qty_for_usdc(
+                        get_step_usdc_volume(next_step, 'LONG'), gprice_expected)
 
-                    if grids_long:
+                    if grids_long and full_check:
                         gid, gobj = list(grids_long.items())[0]
-                        expected_qty = self.calculate_qty_for_usdc(
-                            get_step_usdc_volume(next_step, 'LONG'), gprice_expected)
                         sz_bad = size_mismatch(gobj, expected_qty)
                         px_bad = price_mismatch(gobj, gprice_expected)
                         if sz_bad or px_bad:
@@ -736,16 +760,18 @@ class CCXTUsdcHedgeBot:
                                     reason.append(f"size {gobj.get('amount')}≠{expected_qty}")
                                 if px_bad:
                                     reason.append(f"price {gobj.get('price')}≠{gprice_expected}")
-                                logger.info(f"🔁 Grid_LONG#{next_step} отменён: {', '.join(reason)}")
+                                logger.info(f"🔁 Grid_LONG#{next_step} отменён (deploy): {', '.join(reason)}")
                                 grids_long.clear()
                                 self._known_grid_ids['LONG'] = None
                             except Exception as e:
                                 logger.error(f"❌ cancel grid_LONG: {e}")
-                        else:
-                            self.active_limit_orders[f"LONG_{next_step}"] = gid
-                            if self._known_grid_ids['LONG'] != gid:
-                                logger.info(f"🟢 Grid_LONG#{next_step} подхвачен (size={gobj.get('amount')} @ ${float(gobj.get('price')):,.2f})")
-                                self._known_grid_ids['LONG'] = gid
+
+                    if grids_long:
+                        gid, gobj = list(grids_long.items())[0]
+                        self.active_limit_orders[f"LONG_{next_step}"] = gid
+                        if self._known_grid_ids['LONG'] != gid:
+                            logger.info(f"🟢 Grid_LONG#{next_step} подхвачен (size={gobj.get('amount')} @ ${float(gobj.get('price')):,.2f})")
+                            self._known_grid_ids['LONG'] = gid
 
                     if not grids_long:
                         gqty = self.calculate_qty_for_usdc(
@@ -771,18 +797,30 @@ class CCXTUsdcHedgeBot:
                 if tp_short and size_mismatch(tp_short, s_contracts):
                     try:
                         await self.exchange.cancel_order(str(tp_short['id']), SYMBOL)
-                        logger.info(f"🔁 TP_SHORT отменён: размер {tp_short.get('amount')} ≠ позиции {s_contracts}")
+                        logger.info(f"🔁 TP_SHORT пересоздаётся: size {tp_short.get('amount')} ≠ позиции {s_contracts}")
                         tp_short = None
                         self.short_tp_order_id = None
                     except Exception as e:
                         logger.error(f"❌ cancel TP_SHORT: {e}")
+
+                if full_check and tp_short:
+                    expected_tp = self.round_price(s_entry * (1.0 - WINNER_TAKE_PROFIT_PCT / 100.0))
+                    if price_mismatch(tp_short, expected_tp):
+                        try:
+                            await self.exchange.cancel_order(str(tp_short['id']), SYMBOL)
+                            logger.info(f"🔁 TP_SHORT отменён (deploy): price {tp_short.get('price')} ≠ {expected_tp}")
+                            tp_short = None
+                            self.short_tp_order_id = None
+                        except Exception as e:
+                            logger.error(f"❌ cancel TP_SHORT: {e}")
 
                 if tp_short:
                     new_id = str(tp_short['id'])
                     if self.short_tp_order_id != new_id:
                         logger.info(f"🔻 TP_SHORT подхвачен (size={tp_short.get('amount')} @ ${float(tp_short['price']):,.2f})")
                     self.short_tp_order_id = new_id
-                elif not self.short_tp_order_id:
+                else:
+                    self.short_tp_order_id = None
                     tp_price = self.round_price(s_entry * (1.0 - (WINNER_TAKE_PROFIT_PCT / 100.0)))
                     try:
                         n = await self.exchange.create_order(
@@ -793,16 +831,15 @@ class CCXTUsdcHedgeBot:
                     except Exception as e:
                         logger.error(f"❌ create TP_SHORT: {e}")
 
-                # 💡 Сетка от ТЕКУЩЕЙ СРЕДНЕЙ (s_entry), не от initial_short_entry
                 next_step = self.short_loser_step + 1
                 if next_step <= GRID_LEVELS:
                     dist = get_grid_step_percent(next_step)
                     gprice_expected = self.round_price(s_entry * (1.0 + (dist / 100.0)))
+                    expected_qty = self.calculate_qty_for_usdc(
+                        get_step_usdc_volume(next_step, 'SHORT'), gprice_expected)
 
-                    if grids_short:
+                    if grids_short and full_check:
                         gid, gobj = list(grids_short.items())[0]
-                        expected_qty = self.calculate_qty_for_usdc(
-                            get_step_usdc_volume(next_step, 'SHORT'), gprice_expected)
                         sz_bad = size_mismatch(gobj, expected_qty)
                         px_bad = price_mismatch(gobj, gprice_expected)
                         if sz_bad or px_bad:
@@ -813,16 +850,18 @@ class CCXTUsdcHedgeBot:
                                     reason.append(f"size {gobj.get('amount')}≠{expected_qty}")
                                 if px_bad:
                                     reason.append(f"price {gobj.get('price')}≠{gprice_expected}")
-                                logger.info(f"🔁 Grid_SHORT#{next_step} отменён: {', '.join(reason)}")
+                                logger.info(f"🔁 Grid_SHORT#{next_step} отменён (deploy): {', '.join(reason)}")
                                 grids_short.clear()
                                 self._known_grid_ids['SHORT'] = None
                             except Exception as e:
                                 logger.error(f"❌ cancel grid_SHORT: {e}")
-                        else:
-                            self.active_limit_orders[f"SHORT_{next_step}"] = gid
-                            if self._known_grid_ids['SHORT'] != gid:
-                                logger.info(f"🔻 Grid_SHORT#{next_step} подхвачен (size={gobj.get('amount')} @ ${float(gobj.get('price')):,.2f})")
-                                self._known_grid_ids['SHORT'] = gid
+
+                    if grids_short:
+                        gid, gobj = list(grids_short.items())[0]
+                        self.active_limit_orders[f"SHORT_{next_step}"] = gid
+                        if self._known_grid_ids['SHORT'] != gid:
+                            logger.info(f"🔻 Grid_SHORT#{next_step} подхвачен (size={gobj.get('amount')} @ ${float(gobj.get('price')):,.2f})")
+                            self._known_grid_ids['SHORT'] = gid
 
                     if not grids_short:
                         gqty = self.calculate_qty_for_usdc(
@@ -841,7 +880,7 @@ class CCXTUsdcHedgeBot:
                     self._known_grid_ids['SHORT'] = None
 
         except Exception as e:
-            logger.error(f"❌ audit_and_sync_all_orders: {e}")
+            logger.error(f"❌ audit_and_sync_all_orders (mode={mode}): {e}")
 
     # ============================ RECOVER ============================
 
@@ -939,7 +978,7 @@ class CCXTUsdcHedgeBot:
 
             self._known_grid_ids = {'LONG': None, 'SHORT': None}
             self._last_audit_time = 0.0
-            await self.audit_and_sync_all_orders()
+            await self.audit_and_sync_all_orders(mode="deploy")
 
     # ============================ REOPEN ============================
 
@@ -959,6 +998,11 @@ class CCXTUsdcHedgeBot:
 
             fallback_notional = captured_avg * captured_ct if (captured_avg > 0 and captured_ct > 0) else base_usdc_for_side
 
+            # 🧹 ПЕРЕД market: отменить ВСЁ по этой стороне (свежий fetch, не снимок)
+            #    Старые TP и сетки от закрытой позиции невалидны для нового входа
+            await self._cancel_all_orders_for_side(winner_side)
+
+            # Сброс state
             if winner_side == 'LONG':
                 self.long_tp_order_id = None
                 self.long_contracts_prev = 0
@@ -973,7 +1017,8 @@ class CCXTUsdcHedgeBot:
                 self._known_grid_ids['SHORT'] = None
             self.save_state()
 
-            logger.info(f"🎉 [{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc}) исполнен. Переоткрытие...")
+            logger.info(f"🎉 [{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc}) исполнен. "
+                        f"Все ордера отменены. Переоткрытие...")
             qty = self.calculate_qty_for_usdc(base_usdc_for_side, current_price)
             side = 'buy' if winner_side == 'LONG' else 'sell'
 
@@ -1003,7 +1048,8 @@ class CCXTUsdcHedgeBot:
                         self.save_state()
                         success = True
 
-                        await self.audit_and_sync_all_orders()
+                        # deploy-режим: создаст свежие TP и сетку от новой средней
+                        await self.audit_and_sync_all_orders(mode="deploy")
 
                         new_entry_notional = entry * contracts
                         asyncio.create_task(self._delayed_pnl_report(
@@ -1053,7 +1099,7 @@ class CCXTUsdcHedgeBot:
                     f"⚠️ <b>[{SYMBOL_DISPLAY}] Не удалось переоткрыть {winner_side}</b>\n"
                     f"Синхронизация выполнена. Проверьте позицию вручную.")
 
-                await self.audit_and_sync_all_orders()
+                await self.audit_and_sync_all_orders(mode="deploy")
 
     # ============================ MAIN LOOP ============================
 
@@ -1079,12 +1125,6 @@ class CCXTUsdcHedgeBot:
                         self.last_long_tp_time = current_time
                         tp_detected_at_ms = int(current_time * 1000)
                         logger.info(f"✅ LONG TP (полное закрытие, drop={drop_diff:.6f})")
-                        for o in open_orders:
-                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
-                                try:
-                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
-                                except Exception:
-                                    pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
                         await self.reopen_winner_position(
                             float(ticker['last']), 'LONG', tp_detected_at_ms=tp_detected_at_ms)
@@ -1102,12 +1142,6 @@ class CCXTUsdcHedgeBot:
                         self.last_short_tp_time = current_time
                         tp_detected_at_ms = int(current_time * 1000)
                         logger.info(f"✅ SHORT TP (полное закрытие, drop={drop_diff:.6f})")
-                        for o in open_orders:
-                            if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
-                                try:
-                                    await self.exchange.cancel_order(str(o['id']), SYMBOL)
-                                except Exception:
-                                    pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
                         await self.reopen_winner_position(
                             float(ticker['last']), 'SHORT', tp_detected_at_ms=tp_detected_at_ms)
