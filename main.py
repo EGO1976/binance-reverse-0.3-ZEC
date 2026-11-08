@@ -141,17 +141,21 @@ class CCXTUsdcHedgeBot:
             logger.error(f"⚠️ load_state: {e}")
 
     def _infer_step_from_position(self, contracts: float, avg_entry: float) -> int:
+        """Определяет шаг по объёму позиции.
+        Фактические объёмы: base(1x) + avg1(1x) + avg2(2x) + avg3(4x).
+        Значит after step: ratio contracts/(BASE/avg) = 1 / 2 / 4 / 8.
+        Пороги — середины: 1.5 / 3.0 / 6.0."""
         if avg_entry <= 0 or contracts <= 0:
             return 0
         base_qty = BASE_ORDER_USDC / avg_entry
         if base_qty <= 0:
             return 0
         ratio = contracts / base_qty
-        if ratio < 2:
+        if ratio < 1.5:
             return 0
-        if ratio < 5:
+        if ratio < 3.0:
             return 1
-        if ratio < 11:
+        if ratio < 6.0:
             return 2
         return 3
 
@@ -254,7 +258,8 @@ class CCXTUsdcHedgeBot:
         return qty
 
     async def get_actual_position_entry_price(self, position_side):
-        for _ in range(5):
+        # 3 попытки × 0.3с = максимум 0.9с (было 5 × 0.5 = 2.5с)
+        for _ in range(3):
             try:
                 positions = await self.exchange.fetch_positions([SYMBOL])
                 pos = next((p for p in positions if p['side'] == position_side.lower() and float(p['contracts']) > 0), None)
@@ -262,13 +267,13 @@ class CCXTUsdcHedgeBot:
                     return float(pos['entryPrice']), float(pos['contracts'])
             except Exception as e:
                 logger.error(f"Ошибка получения позиции {position_side}: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         return 0.0, 0.0
 
     # ============================ PnL ============================
 
-    async def _fetch_trades_by_order(self, order_id, retries=6):
-        """userTrades по orderId. Прямой REST Binance."""
+    async def _fetch_trades_by_order(self, order_id, retries=4):
+        """userTrades по orderId. Прямой REST Binance. retries=4 → max 2с."""
         if not order_id:
             return []
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
@@ -288,8 +293,7 @@ class CCXTUsdcHedgeBot:
         return []
 
     async def _fetch_trades_since(self, start_ms, retries=3):
-        """userTrades ТОЛЬКО с startTime, БЕЗ endTime.
-        Обход 7-дневного лимита Binance (startTime+endTime > 7д → -1127)."""
+        """userTrades ТОЛЬКО с startTime, БЕЗ endTime — обход 7-дневного лимита."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
         for attempt in range(retries):
             try:
@@ -306,8 +310,7 @@ class CCXTUsdcHedgeBot:
         return []
 
     async def _fetch_commission_income(self, start_ms, end_ms, retries=2):
-        """Fallback: COMMISSION через /fapi/v1/income.
-        Дробим на 6-дневные окна (Binance тоже лимитирует 7д для income)."""
+        """Fallback COMMISSION через /fapi/v1/income, 6-дневные окна."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
         total_fee = 0.0
         total_count = 0
@@ -331,7 +334,7 @@ class CCXTUsdcHedgeBot:
                             total_count += 1
                         break
                 except Exception as e:
-                    logger.debug(f"income chunk {cursor}-{chunk_end} попытка {attempt+1}: {e}")
+                    logger.debug(f"income chunk попытка {attempt+1}: {e}")
                     await asyncio.sleep(0.3)
             cursor = chunk_end + 1
 
@@ -342,11 +345,6 @@ class CCXTUsdcHedgeBot:
     async def fetch_tp_pnl(self, tp_order_id=None, side=None,
                            fallback_entry_notional=0.0,
                            new_entry_order_id=None, new_entry_notional=0.0):
-        """PnL по TP + комиссия нового входа после реопена:
-        - gross: сумма realizedPnl по TP-trades
-        - close_fee: обычно 0 (maker-TP)
-        - entry_fee: commission по entry-trades (walk-back)
-        - new_entry_fee: commission по MARKET нового входа"""
         result = {
             'gross': 0.0, 'entry_fee': 0.0, 'close_fee': 0.0,
             'fee': 0.0, 'net': 0.0, 'balance': 0.0, 'source': 'none',
@@ -365,7 +363,6 @@ class CCXTUsdcHedgeBot:
             logger.error("❌ fetch_tp_pnl: tp_order_id is None")
             return result
 
-        # ─── 1. TP-trades ───
         tp_trades = await self._fetch_trades_by_order(tp_order_id)
         if not tp_trades:
             logger.error(f"❌ userTrades пусты для TP order {tp_order_id}")
@@ -394,7 +391,6 @@ class CCXTUsdcHedgeBot:
         logger.info(f"✅ TP trades: {len(tp_trades)} шт | "
                     f"gross={result['gross']:+.6f} | close_fee={result['close_fee']:.6f} (maker=0 ✓)")
 
-        # ─── 2. Entry-trades (walk-back) ───
         if side not in ('LONG', 'SHORT'):
             logger.warning(f"⚠️ side={side} — entry_fee не считаем")
         else:
@@ -420,7 +416,6 @@ class CCXTUsdcHedgeBot:
 
                 filtered.sort(key=lambda t: int(t.get('time', 0) or 0), reverse=True)
 
-                # walk-back: стоп на первом gap > 1 час
                 current_block = []
                 last_ms = None
                 for t in filtered:
@@ -461,9 +456,8 @@ class CCXTUsdcHedgeBot:
                 logger.warning(f"⚠️ entry_fee оценочно: {fallback_entry_notional:.2f} × "
                                f"{TAKER_FEE_RATE*100:.2f}% = {estimate:.6f} USDC")
 
-        # ─── 3. Комиссия нового входа (MARKET после реопена) ───
         if new_entry_order_id:
-            new_trades = await self._fetch_trades_by_order(new_entry_order_id, retries=4)
+            new_trades = await self._fetch_trades_by_order(new_entry_order_id, retries=3)
             if new_trades:
                 for t in new_trades:
                     result['new_entry_fee'] += abs(float(t.get('commission', 0) or 0))
@@ -481,7 +475,6 @@ class CCXTUsdcHedgeBot:
                            f"{new_entry_notional:.2f} × {TAKER_FEE_RATE*100:.2f}% = "
                            f"{result['new_entry_fee']:.6f}")
 
-        # ─── 4. Итог ───
         result['fee'] = result['entry_fee'] + result['close_fee']
         result['net'] = result['gross'] - result['fee']
         result['source'] = 'rest_userTrades'
@@ -715,6 +708,9 @@ class CCXTUsdcHedgeBot:
                 avg = float(long_pos['entryPrice'])
                 inferred_step = self._infer_step_from_position(contracts, avg)
 
+                base_qty_for_log = BASE_ORDER_USDC / avg if avg > 0 else 0
+                ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
+
                 if self.initial_long_entry > 0 and self.long_loser_step == inferred_step:
                     logger.info(f"📂 LONG state OK: step={inferred_step}, init=${self.initial_long_entry:,.2f}")
                 else:
@@ -724,7 +720,8 @@ class CCXTUsdcHedgeBot:
 
                 self.long_entry_price = avg
                 self.long_contracts_prev = contracts
-                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {contracts} | Avg: ${avg:,.2f} | Step: {inferred_step}")
+                logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG подхвачен: {contracts} | Avg: ${avg:,.2f} | "
+                            f"Step: {inferred_step} (ratio={ratio_for_log:.2f})")
                 await send_tg_message(self.http_session,
                     f"🟢 <b>[{SYMBOL_DISPLAY}] LONG подхвачен</b>\n"
                     f"Avg: ${avg:,.2f} | Step: {inferred_step}/{GRID_LEVELS} | Объём: {contracts}")
@@ -747,6 +744,9 @@ class CCXTUsdcHedgeBot:
                 avg = float(short_pos['entryPrice'])
                 inferred_step = self._infer_step_from_position(contracts, avg)
 
+                base_qty_for_log = BASE_ORDER_USDC / avg if avg > 0 else 0
+                ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
+
                 if self.initial_short_entry > 0 and self.short_loser_step == inferred_step:
                     logger.info(f"📂 SHORT state OK: step={inferred_step}")
                 else:
@@ -756,7 +756,8 @@ class CCXTUsdcHedgeBot:
 
                 self.short_entry_price = avg
                 self.short_contracts_prev = contracts
-                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {contracts} | Avg: ${avg:,.2f} | Step: {inferred_step}")
+                logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT подхвачен: {contracts} | Avg: ${avg:,.2f} | "
+                            f"Step: {inferred_step} (ratio={ratio_for_log:.2f})")
                 await send_tg_message(self.http_session,
                     f"🔻 <b>[{SYMBOL_DISPLAY}] SHORT подхвачен</b>\n"
                     f"Avg: ${avg:,.2f} | Step: {inferred_step}/{GRID_LEVELS} | Объём: {contracts}")
@@ -825,7 +826,7 @@ class CCXTUsdcHedgeBot:
                         if not new_order_id and isinstance(new_order.get('info'), dict):
                             new_order_id = new_order['info'].get('orderId')
 
-                    await asyncio.sleep(0.8)
+                    await asyncio.sleep(0.5)
                     entry, contracts = await self.get_actual_position_entry_price(winner_side)
                     if entry > 0 and contracts > 0:
                         if winner_side == 'LONG':
@@ -839,8 +840,11 @@ class CCXTUsdcHedgeBot:
                         self.save_state()
                         success = True
 
-                        new_entry_notional = entry * contracts
+                        # ⚡ СНАЧАЛА выставляем TP и сетку — быстро (~2-3 сек от market)
+                        await self.audit_and_sync_all_orders()
 
+                        # 📊 ПОТОМ считаем PnL и отправляем TG (не блокирует торговлю)
+                        new_entry_notional = entry * contracts
                         details = await self.fetch_tp_pnl(
                             captured_tp_id,
                             side=winner_side,
@@ -906,7 +910,8 @@ class CCXTUsdcHedgeBot:
                     f"⚠️ <b>[{SYMBOL_DISPLAY}] Не удалось переоткрыть {winner_side}</b>\n"
                     f"Синхронизация выполнена. Проверьте позицию вручную.")
 
-            await self.audit_and_sync_all_orders()
+                # даже при неудаче — попытаться выставить TP и сетку
+                await self.audit_and_sync_all_orders()
 
     # ============================ MAIN LOOP ============================
 
