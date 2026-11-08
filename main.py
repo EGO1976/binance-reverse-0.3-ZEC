@@ -26,6 +26,8 @@ VISIBLE_GRID_LEVELS = 1
 STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
 AUDIT_INTERVAL = float(os.getenv('AUDIT_INTERVAL', 30.0))
 
+TAKER_FEE_RATE = float(os.getenv('TAKER_FEE_RATE', 0.0004))  # 0.04%
+
 
 def get_grid_step_percent(step: int) -> float:
     if step == 1:
@@ -266,7 +268,7 @@ class CCXTUsdcHedgeBot:
     # ============================ PnL ============================
 
     async def _fetch_trades_by_order(self, order_id, retries=6):
-        """Прямой REST /fapi/v1/userTrades по orderId. Возвращает сырой Binance-массив."""
+        """userTrades по orderId. Прямой REST Binance."""
         if not order_id:
             return []
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
@@ -278,43 +280,81 @@ class CCXTUsdcHedgeBot:
                     'limit': 1000,
                 })
                 if isinstance(trades, list) and trades:
-                    logger.debug(f"✅ userTrades orderId={order_id}: {len(trades)} шт (попытка {attempt+1})")
+                    logger.debug(f"✅ userTrades orderId={order_id}: {len(trades)} шт")
                     return trades
             except Exception as e:
                 logger.debug(f"userTrades orderId={order_id} попытка {attempt+1}: {e}")
             await asyncio.sleep(0.5)
         return []
 
-    async def _fetch_trades_time_window(self, start_ms, end_ms, retries=3):
-        """Прямой REST /fapi/v1/userTrades в окне времени."""
+    async def _fetch_trades_since(self, start_ms, retries=3):
+        """userTrades ТОЛЬКО с startTime, БЕЗ endTime.
+        Обход 7-дневного лимита Binance (startTime+endTime > 7д → -1127)."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
         for attempt in range(retries):
             try:
                 trades = await self.exchange.fapiPrivateGetUserTrades({
                     'symbol': raw_symbol,
                     'startTime': int(start_ms),
-                    'endTime': int(end_ms),
                     'limit': 1000,
                 })
                 if isinstance(trades, list):
                     return trades
             except Exception as e:
-                logger.debug(f"userTrades window попытка {attempt+1}: {e}")
+                logger.debug(f"userTrades since={start_ms} попытка {attempt+1}: {e}")
             await asyncio.sleep(0.5)
         return []
 
-    async def fetch_tp_pnl(self, tp_order_id=None, side=None):
-        """PnL по TP-ордеру:
-        - gross + close_fee: сумма по TP-трейдам (прямой REST /userTrades по orderId)
-        - entry_fee: сумма commission по entry-трейдам (walk-back от TP с gap-детекцией 1ч)
-        Работает и для подхваченных позиций без известного entry orderId."""
+    async def _fetch_commission_income(self, start_ms, end_ms, retries=2):
+        """Fallback: COMMISSION через /fapi/v1/income.
+        Дробим на 6-дневные окна (Binance тоже лимитирует 7д для income)."""
+        raw_symbol = SYMBOL_DISPLAY.replace('/', '')
+        total_fee = 0.0
+        total_count = 0
+        cursor = int(start_ms)
+        end_ms = int(end_ms)
+
+        while cursor < end_ms:
+            chunk_end = min(cursor + 6 * 24 * 3600 * 1000, end_ms)
+            for attempt in range(retries):
+                try:
+                    income = await self.exchange.fapiPrivateGetIncome({
+                        'symbol': raw_symbol,
+                        'incomeType': 'COMMISSION',
+                        'startTime': cursor,
+                        'endTime': chunk_end,
+                        'limit': 1000,
+                    })
+                    if isinstance(income, list):
+                        for item in income:
+                            total_fee += abs(float(item.get('income', 0) or 0))
+                            total_count += 1
+                        break
+                except Exception as e:
+                    logger.debug(f"income chunk {cursor}-{chunk_end} попытка {attempt+1}: {e}")
+                    await asyncio.sleep(0.3)
+            cursor = chunk_end + 1
+
+        if total_count > 0:
+            logger.info(f"💡 Commission income: {total_count} записей | fee={total_fee:.6f}")
+        return total_fee
+
+    async def fetch_tp_pnl(self, tp_order_id=None, side=None,
+                           fallback_entry_notional=0.0,
+                           new_entry_order_id=None, new_entry_notional=0.0):
+        """PnL по TP + комиссия нового входа после реопена:
+        - gross: сумма realizedPnl по TP-trades
+        - close_fee: обычно 0 (maker-TP)
+        - entry_fee: commission по entry-trades (walk-back)
+        - new_entry_fee: commission по MARKET нового входа"""
         result = {
             'gross': 0.0, 'entry_fee': 0.0, 'close_fee': 0.0,
             'fee': 0.0, 'net': 0.0, 'balance': 0.0, 'source': 'none',
             'exit_price': 0.0, 'exit_qty': 0.0,
+            'entry_fee_estimated': False,
+            'new_entry_fee': 0.0, 'new_entry_fee_estimated': False,
         }
 
-        # ─── Баланс ───
         try:
             bal = await self.exchange.fetch_balance()
             result['balance'] = float(bal.get('USDC', {}).get('total', 0.0) or 0.0)
@@ -325,15 +365,18 @@ class CCXTUsdcHedgeBot:
             logger.error("❌ fetch_tp_pnl: tp_order_id is None")
             return result
 
-        # ─── 1. TP-трейды ───
+        # ─── 1. TP-trades ───
         tp_trades = await self._fetch_trades_by_order(tp_order_id)
         if not tp_trades:
             logger.error(f"❌ userTrades пусты для TP order {tp_order_id}")
             result['source'] = 'no_tp_trades'
             return result
 
+        logger.debug(f"RAW TP trade[0]: {json.dumps(tp_trades[0], default=str)}")
+
         total_qty, total_notional = 0.0, 0.0
         tp_times = []
+
         for t in tp_trades:
             result['gross'] += float(t.get('realizedPnl', 0) or 0)
             result['close_fee'] += abs(float(t.get('commission', 0) or 0))
@@ -349,70 +392,105 @@ class CCXTUsdcHedgeBot:
             result['exit_qty'] = total_qty
 
         logger.info(f"✅ TP trades: {len(tp_trades)} шт | "
-                    f"gross={result['gross']:+.6f} | close_fee={result['close_fee']:.6f}")
+                    f"gross={result['gross']:+.6f} | close_fee={result['close_fee']:.6f} (maker=0 ✓)")
 
-        # ─── 2. Entry-трейды (walk-back от TP) ───
+        # ─── 2. Entry-trades (walk-back) ───
         if side not in ('LONG', 'SHORT'):
             logger.warning(f"⚠️ side={side} — entry_fee не считаем")
-            result['fee'] = result['close_fee']
-            result['net'] = result['gross'] - result['fee']
-            result['source'] = 'tp_only'
-            return result
+        else:
+            earliest_tp_ms = min(tp_times) if tp_times else int(time.time() * 1000)
+            entry_side = 'BUY' if side == 'LONG' else 'SELL'
 
-        earliest_tp_ms = min(tp_times) if tp_times else int(time.time() * 1000)
-        entry_side = 'BUY' if side == 'LONG' else 'SELL'
+            entry_block = []
+            used_window_days = None
+            for window_days in (7, 14, 30):
+                start_ms = earliest_tp_ms - window_days * 24 * 3600 * 1000
+                trades = await self._fetch_trades_since(start_ms)
+                if not trades:
+                    continue
 
-        entry_block = []
-        for window_days in (7, 14, 30):
-            start_ms = earliest_tp_ms - window_days * 24 * 3600 * 1000
-            trades = await self._fetch_trades_time_window(start_ms, earliest_tp_ms)
-            if not trades:
-                continue
+                filtered = [
+                    t for t in trades
+                    if str(t.get('positionSide', '')).upper() == side
+                    and str(t.get('side', '')).upper() == entry_side
+                    and int(t.get('time', 0) or 0) < earliest_tp_ms
+                ]
+                if not filtered:
+                    continue
 
-            filtered = [
-                t for t in trades
-                if str(t.get('positionSide', '')).upper() == side
-                and str(t.get('side', '')).upper() == entry_side
-                and int(t.get('time', 0) or 0) < earliest_tp_ms
-            ]
-            if not filtered:
-                continue
+                filtered.sort(key=lambda t: int(t.get('time', 0) or 0), reverse=True)
 
-            filtered.sort(key=lambda t: int(t.get('time', 0) or 0), reverse=True)
+                # walk-back: стоп на первом gap > 1 час
+                current_block = []
+                last_ms = None
+                for t in filtered:
+                    t_ms = int(t.get('time', 0) or 0)
+                    if last_ms is None or (last_ms - t_ms) < 3600 * 1000:
+                        current_block.append(t)
+                        last_ms = t_ms
+                    else:
+                        break
 
-            # Walk-back от последнего entry-fill, стоп на первом gap > 1 час
-            current_block = []
-            last_ms = None
-            for t in filtered:
-                t_ms = int(t.get('time', 0) or 0)
-                if last_ms is None or (last_ms - t_ms) < 3600 * 1000:
-                    current_block.append(t)
-                    last_ms = t_ms
-                else:
+                if current_block:
+                    entry_block = current_block
+                    used_window_days = window_days
                     break
 
-            if current_block:
-                entry_block = current_block
-                logger.debug(f"Entry блок: окно {window_days}д, {len(current_block)} шт")
-                break
+            if entry_block:
+                for t in entry_block:
+                    result['entry_fee'] += abs(float(t.get('commission', 0) or 0))
+                logger.info(f"✅ Entry trades: {len(entry_block)} шт (окно {used_window_days}д) | "
+                            f"entry_fee={result['entry_fee']:.6f}")
 
-        if entry_block:
-            for t in entry_block:
-                result['entry_fee'] += abs(float(t.get('commission', 0) or 0))
-            logger.info(f"✅ Entry trades: {len(entry_block)} шт | "
-                        f"entry_fee={result['entry_fee']:.6f}")
-        else:
-            logger.warning("⚠️ Entry trades не найдены в окне 30д — entry_fee=0")
+                if result['entry_fee'] == 0:
+                    entry_times = [int(t.get('time', 0) or 0) for t in entry_block if t.get('time')]
+                    if entry_times:
+                        en_min = min(entry_times) - 60000
+                        en_max = max(entry_times) + 60000
+                        fallback_en = await self._fetch_commission_income(en_min, en_max)
+                        if fallback_en > 0:
+                            result['entry_fee'] = fallback_en
+                            logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
+            else:
+                logger.warning("⚠️ Entry trades не найдены за 30д")
 
-        # ─── 3. Итог ───
+            if result['entry_fee'] == 0 and fallback_entry_notional > 0:
+                estimate = fallback_entry_notional * TAKER_FEE_RATE
+                result['entry_fee'] = estimate
+                result['entry_fee_estimated'] = True
+                logger.warning(f"⚠️ entry_fee оценочно: {fallback_entry_notional:.2f} × "
+                               f"{TAKER_FEE_RATE*100:.2f}% = {estimate:.6f} USDC")
+
+        # ─── 3. Комиссия нового входа (MARKET после реопена) ───
+        if new_entry_order_id:
+            new_trades = await self._fetch_trades_by_order(new_entry_order_id, retries=4)
+            if new_trades:
+                for t in new_trades:
+                    result['new_entry_fee'] += abs(float(t.get('commission', 0) or 0))
+                logger.info(f"💡 Fee нового входа (order {new_entry_order_id}): "
+                            f"{result['new_entry_fee']:.6f}")
+            if result['new_entry_fee'] == 0 and new_entry_notional > 0:
+                result['new_entry_fee'] = new_entry_notional * TAKER_FEE_RATE
+                result['new_entry_fee_estimated'] = True
+                logger.warning(f"⚠️ new_entry_fee оценочно: {new_entry_notional:.2f} × "
+                               f"{TAKER_FEE_RATE*100:.2f}% = {result['new_entry_fee']:.6f}")
+        elif new_entry_notional > 0:
+            result['new_entry_fee'] = new_entry_notional * TAKER_FEE_RATE
+            result['new_entry_fee_estimated'] = True
+            logger.warning(f"⚠️ new_entry_fee оценочно (без orderId): "
+                           f"{new_entry_notional:.2f} × {TAKER_FEE_RATE*100:.2f}% = "
+                           f"{result['new_entry_fee']:.6f}")
+
+        # ─── 4. Итог ───
         result['fee'] = result['entry_fee'] + result['close_fee']
         result['net'] = result['gross'] - result['fee']
         result['source'] = 'rest_userTrades'
 
         logger.info(f"💰 PnL: gross={result['gross']:+.6f} | "
                     f"entry_fee={result['entry_fee']:.6f} | "
-                    f"close_fee={result['close_fee']:.6f} | "
-                    f"fee_total={result['fee']:.6f} | net={result['net']:+.6f} USDC")
+                    f"close_fee={result['close_fee']:.6f} (maker) | "
+                    f"fee_tp={result['fee']:.6f} | net_tp={result['net']:+.6f} | "
+                    f"new_entry_fee={result['new_entry_fee']:.6f} USDC")
 
         return result
 
@@ -454,7 +532,6 @@ class CCXTUsdcHedgeBot:
                 except Exception:
                     return True
 
-            # --- ORPHAN ---
             if not long_pos:
                 for oid in list(grids_long.keys()) + ([str(tp_long['id'])] if tp_long else []):
                     try:
@@ -710,9 +787,13 @@ class CCXTUsdcHedgeBot:
             step_desc = "Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
 
             captured_tp_id = self.long_tp_order_id if winner_side == 'LONG' else self.short_tp_order_id
+            captured_avg = self.long_entry_price if winner_side == 'LONG' else self.short_entry_price
+            captured_ct = self.long_contracts_prev if winner_side == 'LONG' else self.short_contracts_prev
 
             if not captured_tp_id:
                 logger.warning(f"⚠️ captured_tp_id is None для {winner_side}!")
+
+            fallback_notional = captured_avg * captured_ct if (captured_avg > 0 and captured_ct > 0) else BASE_ORDER_USDC
 
             if winner_side == 'LONG':
                 self.long_tp_order_id = None
@@ -735,8 +816,15 @@ class CCXTUsdcHedgeBot:
             success = False
             for attempt in range(5):
                 try:
-                    await self.exchange.create_order(SYMBOL, 'MARKET', side, qty,
-                                                     params={'positionSide': winner_side})
+                    new_order = await self.exchange.create_order(
+                        SYMBOL, 'MARKET', side, qty,
+                        params={'positionSide': winner_side})
+                    new_order_id = None
+                    if isinstance(new_order, dict):
+                        new_order_id = new_order.get('id')
+                        if not new_order_id and isinstance(new_order.get('info'), dict):
+                            new_order_id = new_order['info'].get('orderId')
+
                     await asyncio.sleep(0.8)
                     entry, contracts = await self.get_actual_position_entry_price(winner_side)
                     if entry > 0 and contracts > 0:
@@ -751,25 +839,38 @@ class CCXTUsdcHedgeBot:
                         self.save_state()
                         success = True
 
+                        new_entry_notional = entry * contracts
+
                         details = await self.fetch_tp_pnl(
                             captured_tp_id,
                             side=winner_side,
+                            fallback_entry_notional=fallback_notional,
+                            new_entry_order_id=new_order_id,
+                            new_entry_notional=new_entry_notional,
                         )
                         pnl_pct = (details['net'] / BASE_ORDER_USDC * 100.0) if BASE_ORDER_USDC > 0 else 0.0
+
                         fee_note = ""
                         if details['source'] == 'no_tp_trades':
-                            fee_note = " ⚠️ (данные Binance задерживаются)"
-                        elif details['entry_fee'] == 0 and abs(details['gross']) > 0.001:
-                            fee_note = " ⚠️ (entry fee не найден)"
+                            fee_note = " ⚠️ (Binance задерживает)"
+                        elif details['entry_fee_estimated']:
+                            fee_note = " ⚠️ (entry оценочно)"
+
+                        close_fee_str = f"{details['close_fee']:.4f}"
+                        if details['close_fee'] == 0:
+                            close_fee_str += " maker"
+
+                        new_fee_note = " ⚠️ оценка" if details['new_entry_fee_estimated'] else ""
 
                         await send_tg_message(self.http_session,
                             f"✅ <b>ТЕЙК-ПРОФИТ ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
                             f"Направление: {winner_side}\n"
-                            f"💰 Net PnL: <b>{details['net']:+.2f} USDC ({pnl_pct:+.2f}%)</b>{fee_note}\n"
-                            f"📊 Gross: {details['gross']:+.2f} | Fee: {details['fee']:.4f} "
-                            f"(entry {details['entry_fee']:.4f} + close {details['close_fee']:.4f})\n"
+                            f"💰 Net PnL (TP): <b>{details['net']:+.2f} USDC ({pnl_pct:+.2f}%)</b>{fee_note}\n"
+                            f"📊 Gross: {details['gross']:+.2f} | Fee TP: {details['fee']:.4f} "
+                            f"(entry {details['entry_fee']:.4f} + close {close_fee_str})\n"
                             f"💳 Баланс: {details['balance']:.2f} USDC\n"
-                            f"🔄 Новый вход: ${entry:,.2f} | Объём: {contracts}")
+                            f"🔄 Новый вход: ${entry:,.2f} | Объём: {contracts}\n"
+                            f"💸 Fee нового входа: {details['new_entry_fee']:.4f}{new_fee_note}")
                         break
                     await asyncio.sleep(1.0)
                 except Exception as e:
