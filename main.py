@@ -39,7 +39,6 @@ SIX_DAYS_MS = 6 * 24 * 3600 * 1000
 
 
 def get_base_usdc(side: str) -> float:
-    """Размер базового ордера для стороны."""
     return BASE_ORDER_USDC_LONG if side == 'LONG' else BASE_ORDER_USDC_SHORT
 
 
@@ -271,7 +270,6 @@ class CCXTUsdcHedgeBot:
         return qty
 
     async def get_actual_position_entry_price(self, position_side):
-        # ⚡ 3 попытки × 0.15с = макс 0.45с
         for _ in range(3):
             try:
                 positions = await self.exchange.fetch_positions([SYMBOL])
@@ -286,13 +284,10 @@ class CCXTUsdcHedgeBot:
     # ============================ PnL ============================
 
     async def _fetch_trades_by_order(self, order_id, retries=4, start_hint_ms=None):
-        """userTrades по orderId. При пустом ответе — fallback через time window
-        (обход задержки индексации Binance)."""
         if not order_id:
             return []
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
 
-        # Primary: запрос по orderId
         for attempt in range(retries):
             try:
                 trades = await self.exchange.fapiPrivateGetUserTrades({
@@ -307,7 +302,6 @@ class CCXTUsdcHedgeBot:
                 logger.debug(f"userTrades orderId={order_id} попытка {attempt+1}: {e}")
             await asyncio.sleep(0.5)
 
-        # Fallback: time window + client-side фильтр по orderId
         if start_hint_ms is None:
             start_hint_ms = int(time.time() * 1000) - 15 * 60 * 1000
         try:
@@ -323,8 +317,6 @@ class CCXTUsdcHedgeBot:
         return []
 
     async def _fetch_trades_since(self, start_ms, retries=3):
-        """userTrades с startTime. Дробит на 6-дневные окна — обход
-        лимита Binance (startTime + endTime > 7д → ошибка -1127)."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
         now_ms = int(time.time() * 1000)
         span = now_ms - start_ms
@@ -371,7 +363,6 @@ class CCXTUsdcHedgeBot:
         return all_trades
 
     async def _fetch_commission_income(self, start_ms, end_ms, retries=2):
-        """Fallback COMMISSION через /fapi/v1/income, 6-дневные окна."""
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
         total_fee = 0.0
         total_count = 0
@@ -572,13 +563,11 @@ class CCXTUsdcHedgeBot:
                                   base_usdc_for_side, tp_detected_at_ms=None):
         """Адаптивный PnL-отчёт:
         - Опрашивает userTrades по TP каждые PNL_POLL_INTERVAL_SEC
-        - Отправляет TG сразу как только Binance отдал данные
+        - Отправляет ОДНО финальное TG-сообщение как только данные готовы
         - Не блокирует торговлю, живёт отдельной задачей
         - Ждёт максимум PNL_MAX_WAIT_SEC"""
         start = time.time()
         tp_trades = None
-
-        # Если передан hint — используем как start для fallback по time window
         tp_start_hint = (tp_detected_at_ms - 60_000) if tp_detected_at_ms else None
 
         while time.time() - start < PNL_MAX_WAIT_SEC:
@@ -607,7 +596,6 @@ class CCXTUsdcHedgeBot:
                 f"Направление: {side} | Новый вход: ${entry_price:,.2f}")
             return
 
-        # Данные есть — считаем полный PnL
         try:
             details = await self.fetch_tp_pnl(
                 tp_order_id,
@@ -1003,13 +991,7 @@ class CCXTUsdcHedgeBot:
                         # ⚡ СНАЧАЛА TP + сетка — быстро (~1 сек)
                         await self.audit_and_sync_all_orders()
 
-                        # 📨 Быстрое уведомление о новом входе (без PnL)
-                        await send_tg_message(self.http_session,
-                            f"🔄 <b>[{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc})</b>\n"
-                            f"📥 Новый вход: ${entry:,.2f} | Объём: {contracts}\n"
-                            f"⏳ PnL рассчитывается...")
-
-                        # 📊 Адаптивный PnL-отчёт отдельной задачей
+                        # 📊 ОДНО финальное TG-сообщение через адаптивную задачу
                         new_entry_notional = entry * contracts
                         asyncio.create_task(self._delayed_pnl_report(
                             tp_order_id=captured_tp_id,
