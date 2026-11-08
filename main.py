@@ -31,6 +31,10 @@ AUDIT_INTERVAL = float(os.getenv('AUDIT_INTERVAL', 30.0))
 
 TAKER_FEE_RATE = float(os.getenv('TAKER_FEE_RATE', 0.0004))  # 0.04%
 
+# ⏱️ Адаптивный PnL: как часто опрашиваем Binance и до какого момента
+PNL_POLL_INTERVAL_SEC = float(os.getenv('PNL_POLL_INTERVAL_SEC', 2.0))
+PNL_MAX_WAIT_SEC = float(os.getenv('PNL_MAX_WAIT_SEC', 30.0))
+
 SIX_DAYS_MS = 6 * 24 * 3600 * 1000
 
 
@@ -152,9 +156,6 @@ class CCXTUsdcHedgeBot:
             logger.error(f"⚠️ load_state: {e}")
 
     def _infer_step_from_position(self, contracts: float, avg_entry: float, side: str) -> int:
-        """Определяет шаг по объёму позиции для конкретной стороны.
-        Объёмы: base(1x) + avg1(1x) + avg2(2x) + avg3(4x) → ratio 1/2/4/8.
-        Пороги — середины: 1.5 / 3.0 / 6.0."""
         if avg_entry <= 0 or contracts <= 0:
             return 0
         base_usdc = get_base_usdc(side)
@@ -284,11 +285,14 @@ class CCXTUsdcHedgeBot:
 
     # ============================ PnL ============================
 
-    async def _fetch_trades_by_order(self, order_id, retries=4):
-        """userTrades по orderId. Прямой REST Binance."""
+    async def _fetch_trades_by_order(self, order_id, retries=4, start_hint_ms=None):
+        """userTrades по orderId. При пустом ответе — fallback через time window
+        (обход задержки индексации Binance)."""
         if not order_id:
             return []
         raw_symbol = SYMBOL_DISPLAY.replace('/', '')
+
+        # Primary: запрос по orderId
         for attempt in range(retries):
             try:
                 trades = await self.exchange.fapiPrivateGetUserTrades({
@@ -297,11 +301,25 @@ class CCXTUsdcHedgeBot:
                     'limit': 1000,
                 })
                 if isinstance(trades, list) and trades:
-                    logger.debug(f"✅ userTrades orderId={order_id}: {len(trades)} шт")
+                    logger.debug(f"✅ userTrades orderId={order_id}: {len(trades)} шт (primary)")
                     return trades
             except Exception as e:
                 logger.debug(f"userTrades orderId={order_id} попытка {attempt+1}: {e}")
             await asyncio.sleep(0.5)
+
+        # Fallback: time window + client-side фильтр по orderId
+        if start_hint_ms is None:
+            start_hint_ms = int(time.time() * 1000) - 15 * 60 * 1000
+        try:
+            window_trades = await self._fetch_trades_since(start_hint_ms, retries=2)
+            matched = [t for t in window_trades
+                       if int(t.get('orderId', 0) or 0) == int(order_id)]
+            if matched:
+                logger.info(f"💡 userTrades orderId={order_id}: {len(matched)} шт (fallback by time)")
+                return matched
+        except Exception as e:
+            logger.debug(f"fallback by time для {order_id}: {e}")
+
         return []
 
     async def _fetch_trades_since(self, start_ms, retries=3):
@@ -387,7 +405,8 @@ class CCXTUsdcHedgeBot:
 
     async def fetch_tp_pnl(self, tp_order_id=None, side=None,
                            fallback_entry_notional=0.0,
-                           new_entry_order_id=None, new_entry_notional=0.0):
+                           new_entry_order_id=None, new_entry_notional=0.0,
+                           tp_start_hint_ms=None):
         result = {
             'gross': 0.0, 'entry_fee': 0.0, 'close_fee': 0.0,
             'fee': 0.0, 'net': 0.0, 'balance': 0.0, 'source': 'none',
@@ -406,7 +425,7 @@ class CCXTUsdcHedgeBot:
             logger.error("❌ fetch_tp_pnl: tp_order_id is None")
             return result
 
-        tp_trades = await self._fetch_trades_by_order(tp_order_id)
+        tp_trades = await self._fetch_trades_by_order(tp_order_id, start_hint_ms=tp_start_hint_ms)
         if not tp_trades:
             logger.error(f"❌ userTrades пусты для TP order {tp_order_id}")
             result['source'] = 'no_tp_trades'
@@ -491,7 +510,6 @@ class CCXTUsdcHedgeBot:
                             logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
             else:
                 logger.warning("⚠️ Entry trades не найдены за 30д")
-                # 💡 диагностика: пробный запрос за 6 дней
                 try:
                     probe = await self.exchange.fapiPrivateGetUserTrades({
                         'symbol': SYMBOL_DISPLAY.replace('/', ''),
@@ -545,6 +563,85 @@ class CCXTUsdcHedgeBot:
                     f"new_entry_fee={result['new_entry_fee']:.6f} USDC")
 
         return result
+
+    # ============================ ADAPTIVE PnL REPORT ============================
+
+    async def _delayed_pnl_report(self, tp_order_id, side, step_desc,
+                                  fallback_entry_notional, new_entry_order_id,
+                                  new_entry_notional, entry_price, contracts,
+                                  base_usdc_for_side, tp_detected_at_ms=None):
+        """Адаптивный PnL-отчёт:
+        - Опрашивает userTrades по TP каждые PNL_POLL_INTERVAL_SEC
+        - Отправляет TG сразу как только Binance отдал данные
+        - Не блокирует торговлю, живёт отдельной задачей
+        - Ждёт максимум PNL_MAX_WAIT_SEC"""
+        start = time.time()
+        tp_trades = None
+
+        # Если передан hint — используем как start для fallback по time window
+        tp_start_hint = (tp_detected_at_ms - 60_000) if tp_detected_at_ms else None
+
+        while time.time() - start < PNL_MAX_WAIT_SEC:
+            try:
+                tp_trades = await self._fetch_trades_by_order(
+                    tp_order_id, retries=1, start_hint_ms=tp_start_hint)
+                if tp_trades:
+                    waited = time.time() - start
+                    logger.info(f"💡 PnL-данные готовы через {waited:.1f}с "
+                                f"(order {tp_order_id})")
+                    break
+            except Exception as e:
+                logger.debug(f"poll tp_trades: {e}")
+
+            waited = time.time() - start
+            logger.debug(f"⏳ ждём индексации userTrades... {waited:.1f}с / {PNL_MAX_WAIT_SEC}с")
+            await asyncio.sleep(PNL_POLL_INTERVAL_SEC)
+
+        if not tp_trades:
+            logger.warning(f"⚠️ userTrades не появились за {PNL_MAX_WAIT_SEC}с "
+                           f"для order {tp_order_id}")
+            await send_tg_message(self.http_session,
+                f"⚠️ <b>[{SYMBOL_DISPLAY}] PnL не получен</b>\n"
+                f"Binance не отдал данные по TP order {tp_order_id} "
+                f"за {PNL_MAX_WAIT_SEC}с.\n"
+                f"Направление: {side} | Новый вход: ${entry_price:,.2f}")
+            return
+
+        # Данные есть — считаем полный PnL
+        try:
+            details = await self.fetch_tp_pnl(
+                tp_order_id,
+                side=side,
+                fallback_entry_notional=fallback_entry_notional,
+                new_entry_order_id=new_entry_order_id,
+                new_entry_notional=new_entry_notional,
+                tp_start_hint_ms=tp_start_hint,
+            )
+            pnl_pct = (details['net'] / base_usdc_for_side * 100.0) if base_usdc_for_side > 0 else 0.0
+
+            fee_note = ""
+            if details['source'] == 'no_tp_trades':
+                fee_note = " ⚠️ (Binance задерживает)"
+            elif details['entry_fee_estimated']:
+                fee_note = " ⚠️ (entry оценочно)"
+
+            close_fee_str = f"{details['close_fee']:.4f}"
+            if details['close_fee'] == 0:
+                close_fee_str += " maker"
+
+            new_fee_note = " ⚠️ оценка" if details['new_entry_fee_estimated'] else ""
+
+            await send_tg_message(self.http_session,
+                f"✅ <b>ТЕЙК-ПРОФИТ ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
+                f"Направление: {side}\n"
+                f"💰 Net PnL (TP): <b>{details['net']:+.2f} USDC ({pnl_pct:+.2f}%)</b>{fee_note}\n"
+                f"📊 Gross: {details['gross']:+.2f} | Fee TP: {details['fee']:.4f} "
+                f"(entry {details['entry_fee']:.4f} + close {close_fee_str})\n"
+                f"💳 Баланс: {details['balance']:.2f} USDC\n"
+                f"🔄 Новый вход: ${entry_price:,.2f} | Объём: {contracts}\n"
+                f"💸 Fee нового входа: {details['new_entry_fee']:.4f}{new_fee_note}")
+        except Exception as e:
+            logger.error(f"❌ delayed_pnl_report для {tp_order_id}: {e}")
 
     # ============================ AUDIT ============================
 
@@ -843,7 +940,7 @@ class CCXTUsdcHedgeBot:
 
     # ============================ REOPEN ============================
 
-    async def reopen_winner_position(self, current_price, winner_side):
+    async def reopen_winner_position(self, current_price, winner_side, tp_detected_at_ms=None):
         async with self.exec_lock:
             triggered_step = self.long_loser_step if winner_side == 'LONG' else self.short_loser_step
             step_desc = "Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
@@ -889,7 +986,6 @@ class CCXTUsdcHedgeBot:
                         if not new_order_id and isinstance(new_order.get('info'), dict):
                             new_order_id = new_order['info'].get('orderId')
 
-                    # ⚡ Минимальная пауза — TP и сетка выставляются в течение ~1 сек
                     await asyncio.sleep(0.15)
                     entry, contracts = await self.get_actual_position_entry_price(winner_side)
                     if entry > 0 and contracts > 0:
@@ -904,41 +1000,29 @@ class CCXTUsdcHedgeBot:
                         self.save_state()
                         success = True
 
-                        # ⚡ СНАЧАЛА TP + сетка — быстро
+                        # ⚡ СНАЧАЛА TP + сетка — быстро (~1 сек)
                         await self.audit_and_sync_all_orders()
 
-                        # 📊 ПОТОМ PnL и TG (не блокирует торговлю)
+                        # 📨 Быстрое уведомление о новом входе (без PnL)
+                        await send_tg_message(self.http_session,
+                            f"🔄 <b>[{SYMBOL_DISPLAY}] TP {winner_side} ({step_desc})</b>\n"
+                            f"📥 Новый вход: ${entry:,.2f} | Объём: {contracts}\n"
+                            f"⏳ PnL рассчитывается...")
+
+                        # 📊 Адаптивный PnL-отчёт отдельной задачей
                         new_entry_notional = entry * contracts
-                        details = await self.fetch_tp_pnl(
-                            captured_tp_id,
+                        asyncio.create_task(self._delayed_pnl_report(
+                            tp_order_id=captured_tp_id,
                             side=winner_side,
+                            step_desc=step_desc,
                             fallback_entry_notional=fallback_notional,
                             new_entry_order_id=new_order_id,
                             new_entry_notional=new_entry_notional,
-                        )
-                        pnl_pct = (details['net'] / base_usdc_for_side * 100.0) if base_usdc_for_side > 0 else 0.0
-
-                        fee_note = ""
-                        if details['source'] == 'no_tp_trades':
-                            fee_note = " ⚠️ (Binance задерживает)"
-                        elif details['entry_fee_estimated']:
-                            fee_note = " ⚠️ (entry оценочно)"
-
-                        close_fee_str = f"{details['close_fee']:.4f}"
-                        if details['close_fee'] == 0:
-                            close_fee_str += " maker"
-
-                        new_fee_note = " ⚠️ оценка" if details['new_entry_fee_estimated'] else ""
-
-                        await send_tg_message(self.http_session,
-                            f"✅ <b>ТЕЙК-ПРОФИТ ({SYMBOL_DISPLAY})</b> [{step_desc}]\n"
-                            f"Направление: {winner_side}\n"
-                            f"💰 Net PnL (TP): <b>{details['net']:+.2f} USDC ({pnl_pct:+.2f}%)</b>{fee_note}\n"
-                            f"📊 Gross: {details['gross']:+.2f} | Fee TP: {details['fee']:.4f} "
-                            f"(entry {details['entry_fee']:.4f} + close {close_fee_str})\n"
-                            f"💳 Баланс: {details['balance']:.2f} USDC\n"
-                            f"🔄 Новый вход: ${entry:,.2f} | Объём: {contracts}\n"
-                            f"💸 Fee нового входа: {details['new_entry_fee']:.4f}{new_fee_note}")
+                            entry_price=entry,
+                            contracts=contracts,
+                            base_usdc_for_side=base_usdc_for_side,
+                            tp_detected_at_ms=tp_detected_at_ms,
+                        ))
                         break
                     await asyncio.sleep(0.5)
                 except Exception as e:
@@ -999,6 +1083,7 @@ class CCXTUsdcHedgeBot:
 
                     if is_full_close and (current_time - self.last_long_tp_time > 5.0):
                         self.last_long_tp_time = current_time
+                        tp_detected_at_ms = int(current_time * 1000)
                         logger.info(f"✅ LONG TP (полное закрытие, drop={drop_diff:.6f})")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'LONG':
@@ -1007,7 +1092,8 @@ class CCXTUsdcHedgeBot:
                                 except Exception:
                                     pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
-                        await self.reopen_winner_position(float(ticker['last']), 'LONG')
+                        await self.reopen_winner_position(
+                            float(ticker['last']), 'LONG', tp_detected_at_ms=tp_detected_at_ms)
                         await asyncio.sleep(1)
                         continue
                     else:
@@ -1021,6 +1107,7 @@ class CCXTUsdcHedgeBot:
 
                     if is_full_close and (current_time - self.last_short_tp_time > 5.0):
                         self.last_short_tp_time = current_time
+                        tp_detected_at_ms = int(current_time * 1000)
                         logger.info(f"✅ SHORT TP (полное закрытие, drop={drop_diff:.6f})")
                         for o in open_orders:
                             if str(o.get('info', {}).get('positionSide', '')).upper() == 'SHORT':
@@ -1029,7 +1116,8 @@ class CCXTUsdcHedgeBot:
                                 except Exception:
                                     pass
                         ticker = await self.exchange.fetch_ticker(SYMBOL)
-                        await self.reopen_winner_position(float(ticker['last']), 'SHORT')
+                        await self.reopen_winner_position(
+                            float(ticker['last']), 'SHORT', tp_detected_at_ms=tp_detected_at_ms)
                         await asyncio.sleep(1)
                         continue
                     else:
