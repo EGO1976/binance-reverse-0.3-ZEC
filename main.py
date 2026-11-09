@@ -996,7 +996,10 @@ class CCXTUsdcHedgeBot:
             if not captured_tp_id:
                 logger.warning(f"⚠️ captured_tp_id is None для {winner_side}!")
 
-            fallback_notional = captured_avg * captured_ct if (captured_avg > 0 and captured_ct > 0) else base_usdc_for_side
+            # 💡 ФИКС: оценка entry_fee только от base (MARKET taker).
+            #    Grid-входы = LIMIT maker = 0% комиссии, поэтому полный notional
+            #    (captured_avg × captured_ct) завышал оценку в ~2 раза.
+            fallback_notional = base_usdc_for_side
 
             # 🧹 ПЕРЕД market: отменить ВСЁ по этой стороне (свежий fetch, не снимок)
             #    Старые TP и сетки от закрытой позиции невалидны для нового входа
@@ -1230,7 +1233,6 @@ async def root():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 
 
 
