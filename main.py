@@ -122,6 +122,12 @@ class CCXTUsdcHedgeBot:
         self._known_grid_ids = {'LONG': None, 'SHORT': None}
         self._last_audit_time = 0.0
 
+        # 💡 Точные orderIds для расчёта entry_fee (основной путь PnL)
+        self.long_entry_order_id = 0
+        self.short_entry_order_id = 0
+        self.long_avg_order_ids = []
+        self.short_avg_order_ids = []
+
     # ============================ STATE ============================
 
     def save_state(self):
@@ -134,6 +140,10 @@ class CCXTUsdcHedgeBot:
                     'initial_short_entry': self.initial_short_entry,
                     'long_loser_step': self.long_loser_step,
                     'short_loser_step': self.short_loser_step,
+                    'long_entry_order_id': self.long_entry_order_id,
+                    'short_entry_order_id': self.short_entry_order_id,
+                    'long_avg_order_ids': self.long_avg_order_ids,
+                    'short_avg_order_ids': self.short_avg_order_ids,
                 }, f)
         except Exception as e:
             logger.error(f"⚠️ save_state: {e}")
@@ -147,7 +157,12 @@ class CCXTUsdcHedgeBot:
                 self.initial_short_entry = float(data.get('initial_short_entry', 0.0) or 0.0)
                 self.long_loser_step = int(data.get('long_loser_step', 0) or 0)
                 self.short_loser_step = int(data.get('short_loser_step', 0) or 0)
-                logger.info(f"📂 state загружен: L step={self.long_loser_step}, S step={self.short_loser_step}")
+                self.long_entry_order_id = int(data.get('long_entry_order_id', 0) or 0)
+                self.short_entry_order_id = int(data.get('short_entry_order_id', 0) or 0)
+                self.long_avg_order_ids = [int(x) for x in (data.get('long_avg_order_ids') or []) if x]
+                self.short_avg_order_ids = [int(x) for x in (data.get('short_avg_order_ids') or []) if x]
+                logger.info(f"📂 state загружен: L step={self.long_loser_step}, S step={self.short_loser_step}, "
+                            f"L_oids=[{len(self.long_avg_order_ids)}], S_oids=[{len(self.short_avg_order_ids)}]")
         except Exception as e:
             logger.error(f"⚠️ load_state: {e}")
 
@@ -279,8 +294,6 @@ class CCXTUsdcHedgeBot:
         return 0.0, 0.0
 
     async def _cancel_all_orders_for_side(self, side: str):
-        """Свежий fetch + отмена ВСЕХ открытых ордеров для стороны (TP + все сетки).
-        Гарантирует чистый старт для новой позиции после TP."""
         try:
             fresh_orders = await self.exchange.fetch_open_orders(SYMBOL)
         except Exception as e:
@@ -416,7 +429,10 @@ class CCXTUsdcHedgeBot:
     async def fetch_tp_pnl(self, tp_order_id=None, side=None,
                            fallback_entry_notional=0.0,
                            new_entry_order_id=None, new_entry_notional=0.0,
-                           tp_start_hint_ms=None):
+                           tp_start_hint_ms=None,
+                           target_entry_qty=0.0,
+                           entry_order_id=0,
+                           avg_order_ids=None):
         result = {
             'gross': 0.0, 'entry_fee': 0.0, 'close_fee': 0.0,
             'fee': 0.0, 'net': 0.0, 'balance': 0.0, 'source': 'none',
@@ -464,67 +480,104 @@ class CCXTUsdcHedgeBot:
         if side not in ('LONG', 'SHORT'):
             logger.warning(f"⚠️ side={side} — entry_fee не считаем")
         else:
-            earliest_tp_ms = min(tp_times) if tp_times else int(time.time() * 1000)
-            entry_side = 'BUY' if side == 'LONG' else 'SELL'
+            # ═══ ПУТЬ 1: точные orderIds (основной) ═══
+            if entry_order_id > 0 or (avg_order_ids and len(avg_order_ids) > 0):
+                all_oids = []
+                if entry_order_id > 0:
+                    all_oids.append(int(entry_order_id))
+                if avg_order_ids:
+                    all_oids.extend([int(x) for x in avg_order_ids])
+                logger.info(f"🔍 Entry fees by orderIds ({side}): {all_oids}")
 
-            entry_block = []
-            used_window_days = None
-            for window_days in (7, 14, 30):
-                start_ms = earliest_tp_ms - window_days * 24 * 3600 * 1000
-                trades = await self._fetch_trades_since(start_ms)
-                if not trades:
-                    continue
+                for oid in all_oids:
+                    trades_for_oid = await self._fetch_trades_by_order(oid, retries=3)
+                    for t in trades_for_oid:
+                        result['entry_fee'] += abs(float(t.get('commission', 0) or 0))
 
-                filtered = [
-                    t for t in trades
-                    if str(t.get('positionSide', '')).upper() == side
-                    and str(t.get('side', '')).upper() == entry_side
-                    and int(t.get('time', 0) or 0) < earliest_tp_ms
-                ]
-                if not filtered:
-                    continue
+                if result['entry_fee'] > 0:
+                    logger.info(f"✅ Entry fees by orderIds: {len(all_oids)} ордеров | "
+                                f"entry_fee={result['entry_fee']:.6f}")
+                else:
+                    logger.warning(f"⚠️ userTrades по orderIds вернули 0 commission — "
+                                   f"fallback walk-back")
 
-                filtered.sort(key=lambda t: int(t.get('time', 0) or 0), reverse=True)
+            # ═══ ПУТЬ 2: walk-back (fallback для подхваченных позиций) ═══
+            if result['entry_fee'] == 0:
+                earliest_tp_ms = min(tp_times) if tp_times else int(time.time() * 1000)
+                entry_side = 'BUY' if side == 'LONG' else 'SELL'
 
-                current_block = []
-                last_ms = None
-                for t in filtered:
-                    t_ms = int(t.get('time', 0) or 0)
-                    if last_ms is None or (last_ms - t_ms) < 3600 * 1000:
+                entry_block = []
+                used_window_days = None
+                for window_days in (7, 14, 30):
+                    start_ms = earliest_tp_ms - window_days * 24 * 3600 * 1000
+                    trades = await self._fetch_trades_since(start_ms)
+                    if not trades:
+                        continue
+
+                    filtered = [
+                        t for t in trades
+                        if str(t.get('positionSide', '')).upper() == side
+                        and str(t.get('side', '')).upper() == entry_side
+                        and int(t.get('time', 0) or 0) < earliest_tp_ms
+                    ]
+                    if not filtered:
+                        continue
+
+                    filtered.sort(key=lambda t: int(t.get('time', 0) or 0), reverse=True)
+
+                    current_block = []
+                    last_ms = None
+                    total_qty_walk = 0.0
+                    for t in filtered:
+                        t_ms = int(t.get('time', 0) or 0)
+                        t_qty = abs(float(t.get('qty', 0) or 0))
+                        if last_ms is not None and (last_ms - t_ms) >= 3600 * 1000:
+                            break
                         current_block.append(t)
+                        total_qty_walk += t_qty
                         last_ms = t_ms
-                    else:
+                        if target_entry_qty > 0 and total_qty_walk >= target_entry_qty * 0.99:
+                            break
+
+                    if current_block:
+                        entry_block = current_block
+                        used_window_days = window_days
                         break
 
-                if current_block:
-                    entry_block = current_block
-                    used_window_days = window_days
-                    break
+                if entry_block:
+                    total_qty_from_walk = sum(abs(float(t.get('qty', 0) or 0)) for t in entry_block)
+                    if target_entry_qty > 0 and total_qty_from_walk > target_entry_qty * 1.5:
+                        logger.warning(
+                            f"⚠️ Walk-back grabbed {total_qty_from_walk:.4f} ct vs "
+                            f"позиция {target_entry_qty:.4f} ct — отбрасываем"
+                        )
+                        entry_block = []
 
-            if entry_block:
-                for t in entry_block:
-                    result['entry_fee'] += abs(float(t.get('commission', 0) or 0))
-                logger.info(f"✅ Entry trades: {len(entry_block)} шт (окно {used_window_days}д) | "
-                            f"entry_fee={result['entry_fee']:.6f}")
+                if entry_block:
+                    for t in entry_block:
+                        result['entry_fee'] += abs(float(t.get('commission', 0) or 0))
+                    logger.info(f"✅ Entry trades (walk-back): {len(entry_block)} шт (окно {used_window_days}д) | "
+                                f"entry_fee={result['entry_fee']:.6f}")
 
-                if result['entry_fee'] == 0:
-                    entry_times = [int(t.get('time', 0) or 0) for t in entry_block if t.get('time')]
-                    if entry_times:
-                        en_min = min(entry_times) - 60000
-                        en_max = max(entry_times) + 60000
-                        fallback_en = await self._fetch_commission_income(en_min, en_max)
-                        if fallback_en > 0:
-                            result['entry_fee'] = fallback_en
-                            logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
-            else:
-                logger.warning("⚠️ Entry trades не найдены за 30д")
+                    if result['entry_fee'] == 0:
+                        entry_times = [int(t.get('time', 0) or 0) for t in entry_block if t.get('time')]
+                        if entry_times:
+                            en_min = min(entry_times) - 60000
+                            en_max = max(entry_times) + 60000
+                            fallback_en = await self._fetch_commission_income(en_min, en_max)
+                            if fallback_en > 0:
+                                result['entry_fee'] = fallback_en
+                                logger.info(f"💡 entry_fee через income: {fallback_en:.6f}")
+                else:
+                    logger.warning("⚠️ Walk-back не дал результата")
 
+            # ═══ ПУТЬ 3: оценка ═══
             if result['entry_fee'] == 0 and fallback_entry_notional > 0:
                 estimate = fallback_entry_notional * TAKER_FEE_RATE
                 result['entry_fee'] = estimate
                 result['entry_fee_estimated'] = True
-                logger.warning(f"⚠️ entry_fee оценочно: {fallback_entry_notional:.2f} × "
-                               f"{TAKER_FEE_RATE*100:.2f}% = {estimate:.6f} USDC")
+                logger.warning(f"⚠️ entry_fee оценочно (base ${fallback_entry_notional:.2f} × "
+                               f"{TAKER_FEE_RATE*100:.2f}% taker, grid=maker) = {estimate:.6f} USDC")
 
         if new_entry_order_id:
             new_trades = await self._fetch_trades_by_order(new_entry_order_id, retries=3)
@@ -562,7 +615,9 @@ class CCXTUsdcHedgeBot:
     async def _delayed_pnl_report(self, tp_order_id, side, step_desc,
                                   fallback_entry_notional, new_entry_order_id,
                                   new_entry_notional, entry_price, contracts,
-                                  base_usdc_for_side, tp_detected_at_ms=None):
+                                  base_usdc_for_side, tp_detected_at_ms=None,
+                                  target_entry_qty=0.0,
+                                  entry_order_id=0, avg_order_ids=None):
         start = time.time()
         tp_trades = None
         tp_start_hint = (tp_detected_at_ms - 60_000) if tp_detected_at_ms else None
@@ -601,6 +656,9 @@ class CCXTUsdcHedgeBot:
                 new_entry_order_id=new_entry_order_id,
                 new_entry_notional=new_entry_notional,
                 tp_start_hint_ms=tp_start_hint,
+                target_entry_qty=target_entry_qty,
+                entry_order_id=entry_order_id,
+                avg_order_ids=avg_order_ids,
             )
             pnl_pct = (details['net'] / base_usdc_for_side * 100.0) if base_usdc_for_side > 0 else 0.0
 
@@ -905,6 +963,8 @@ class CCXTUsdcHedgeBot:
             short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
 
             if long_pos:
+                # 💡 Подхват: не трогаем entry_order_id/avg_order_ids — они из state
+                #    (если state был, orderIds сохранены; если нет — 0 → walk-back)
                 contracts = float(long_pos['contracts'])
                 avg = float(long_pos['entryPrice'])
                 inferred_step = self._infer_step_from_position(contracts, avg, 'LONG')
@@ -913,11 +973,13 @@ class CCXTUsdcHedgeBot:
                 ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
 
                 if self.initial_long_entry > 0 and self.long_loser_step == inferred_step:
-                    logger.info(f"📂 LONG state OK: step={inferred_step}, init=${self.initial_long_entry:,.2f}")
+                    logger.info(f"📂 LONG state OK: step={inferred_step}, init=${self.initial_long_entry:,.2f}, "
+                                f"entry_oid={self.long_entry_order_id}, avg_oids={len(self.long_avg_order_ids)}")
                 else:
                     self.long_loser_step = inferred_step
                     self.initial_long_entry = self._infer_initial_entry(avg, inferred_step)
-                    logger.warning(f"⚠️ LONG state скорректирован → step={inferred_step}, init≈${self.initial_long_entry:,.2f}")
+                    logger.warning(f"⚠️ LONG state скорректирован → step={inferred_step}, "
+                                   f"init≈${self.initial_long_entry:,.2f}")
 
                 self.long_entry_price = avg
                 self.long_contracts_prev = contracts
@@ -929,13 +991,28 @@ class CCXTUsdcHedgeBot:
             else:
                 self.long_loser_step = 0
                 self.initial_long_entry = 0.0
+                self.long_entry_order_id = 0
+                self.long_avg_order_ids = []
                 logger.info(f"🟢 [{SYMBOL_DISPLAY}] LONG не найден. Открываем базу ${BASE_ORDER_USDC_LONG}...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC_LONG, current_price)
-                await self.exchange.create_order(SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
+                new_o = await self.exchange.create_order(
+                    SYMBOL, 'MARKET', 'buy', base_qty, params={'positionSide': 'LONG'})
+                new_oid = 0
+                if isinstance(new_o, dict):
+                    oid_raw = new_o.get('id')
+                    if not oid_raw and isinstance(new_o.get('info'), dict):
+                        oid_raw = new_o['info'].get('orderId')
+                    if oid_raw:
+                        try:
+                            new_oid = int(oid_raw)
+                        except (ValueError, TypeError):
+                            pass
+                self.long_entry_order_id = new_oid
                 l_entry, l_ct = await self.get_actual_position_entry_price('LONG')
                 self.long_entry_price = l_entry if l_entry > 0 else current_price
                 self.initial_long_entry = self.long_entry_price
                 self.long_contracts_prev = l_ct if l_ct > 0 else base_qty
+                logger.info(f"🟢 LONG entry_order_id={new_oid}")
                 await send_tg_message(self.http_session,
                     f"🟢 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (LONG)</b>\nЦена: ${self.long_entry_price:,.2f}")
 
@@ -948,11 +1025,13 @@ class CCXTUsdcHedgeBot:
                 ratio_for_log = contracts / base_qty_for_log if base_qty_for_log > 0 else 0
 
                 if self.initial_short_entry > 0 and self.short_loser_step == inferred_step:
-                    logger.info(f"📂 SHORT state OK: step={inferred_step}")
+                    logger.info(f"📂 SHORT state OK: step={inferred_step}, "
+                                f"entry_oid={self.short_entry_order_id}, avg_oids={len(self.short_avg_order_ids)}")
                 else:
                     self.short_loser_step = inferred_step
                     self.initial_short_entry = self._infer_initial_entry(avg, inferred_step)
-                    logger.warning(f"⚠️ SHORT state скорректирован → step={inferred_step}, init≈${self.initial_short_entry:,.2f}")
+                    logger.warning(f"⚠️ SHORT state скорректирован → step={inferred_step}, "
+                                   f"init≈${self.initial_short_entry:,.2f}")
 
                 self.short_entry_price = avg
                 self.short_contracts_prev = contracts
@@ -964,13 +1043,28 @@ class CCXTUsdcHedgeBot:
             else:
                 self.short_loser_step = 0
                 self.initial_short_entry = 0.0
+                self.short_entry_order_id = 0
+                self.short_avg_order_ids = []
                 logger.info(f"🔻 [{SYMBOL_DISPLAY}] SHORT не найден. Открываем базу ${BASE_ORDER_USDC_SHORT}...")
                 base_qty = self.calculate_qty_for_usdc(BASE_ORDER_USDC_SHORT, current_price)
-                await self.exchange.create_order(SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
+                new_o = await self.exchange.create_order(
+                    SYMBOL, 'MARKET', 'sell', base_qty, params={'positionSide': 'SHORT'})
+                new_oid = 0
+                if isinstance(new_o, dict):
+                    oid_raw = new_o.get('id')
+                    if not oid_raw and isinstance(new_o.get('info'), dict):
+                        oid_raw = new_o['info'].get('orderId')
+                    if oid_raw:
+                        try:
+                            new_oid = int(oid_raw)
+                        except (ValueError, TypeError):
+                            pass
+                self.short_entry_order_id = new_oid
                 s_entry, s_ct = await self.get_actual_position_entry_price('SHORT')
                 self.short_entry_price = s_entry if s_entry > 0 else current_price
                 self.initial_short_entry = self.short_entry_price
                 self.short_contracts_prev = s_ct if s_ct > 0 else base_qty
+                logger.info(f"🔻 SHORT entry_order_id={new_oid}")
                 await send_tg_message(self.http_session,
                     f"🔻 <b>[{SYMBOL_DISPLAY}] ОТКРЫТА НОВАЯ ПОЗИЦИЯ (SHORT)</b>\nЦена: ${self.short_entry_price:,.2f}")
 
@@ -988,35 +1082,38 @@ class CCXTUsdcHedgeBot:
             step_desc = "Базовый ордер" if triggered_step == 0 else f"Усреднение №{triggered_step}"
 
             captured_tp_id = self.long_tp_order_id if winner_side == 'LONG' else self.short_tp_order_id
-            captured_avg = self.long_entry_price if winner_side == 'LONG' else self.short_entry_price
             captured_ct = self.long_contracts_prev if winner_side == 'LONG' else self.short_contracts_prev
+            captured_entry_oid = self.long_entry_order_id if winner_side == 'LONG' else self.short_entry_order_id
+            captured_avg_oids = list(self.long_avg_order_ids) if winner_side == 'LONG' else list(self.short_avg_order_ids)
 
             base_usdc_for_side = get_base_usdc(winner_side)
 
             if not captured_tp_id:
                 logger.warning(f"⚠️ captured_tp_id is None для {winner_side}!")
 
-            # 💡 ФИКС: оценка entry_fee только от base (MARKET taker).
-            #    Grid-входы = LIMIT maker = 0% комиссии, поэтому полный notional
-            #    (captured_avg × captured_ct) завышал оценку в ~2 раза.
+            logger.info(f"🔍 Captured for {winner_side}: tp={captured_tp_id}, "
+                        f"entry_oid={captured_entry_oid}, avg_oids={captured_avg_oids}")
+
+            # fallback_notional только от base — для случая полного отсутствия orderIds
             fallback_notional = base_usdc_for_side
 
-            # 🧹 ПЕРЕД market: отменить ВСЁ по этой стороне (свежий fetch, не снимок)
-            #    Старые TP и сетки от закрытой позиции невалидны для нового входа
             await self._cancel_all_orders_for_side(winner_side)
 
-            # Сброс state
             if winner_side == 'LONG':
                 self.long_tp_order_id = None
                 self.long_contracts_prev = 0
                 self.long_loser_step = 0
                 self.initial_long_entry = 0
+                self.long_entry_order_id = 0
+                self.long_avg_order_ids = []
                 self._known_grid_ids['LONG'] = None
             else:
                 self.short_tp_order_id = None
                 self.short_contracts_prev = 0
                 self.short_loser_step = 0
                 self.initial_short_entry = 0
+                self.short_entry_order_id = 0
+                self.short_avg_order_ids = []
                 self._known_grid_ids['SHORT'] = None
             self.save_state()
 
@@ -1044,14 +1141,23 @@ class CCXTUsdcHedgeBot:
                             self.long_entry_price = entry
                             self.initial_long_entry = entry
                             self.long_contracts_prev = contracts
+                            try:
+                                self.long_entry_order_id = int(new_order_id) if new_order_id else 0
+                            except (ValueError, TypeError):
+                                self.long_entry_order_id = 0
+                            self.long_avg_order_ids = []
                         else:
                             self.short_entry_price = entry
                             self.initial_short_entry = entry
                             self.short_contracts_prev = contracts
+                            try:
+                                self.short_entry_order_id = int(new_order_id) if new_order_id else 0
+                            except (ValueError, TypeError):
+                                self.short_entry_order_id = 0
+                            self.short_avg_order_ids = []
                         self.save_state()
                         success = True
 
-                        # deploy-режим: создаст свежие TP и сетку от новой средней
                         await self.audit_and_sync_all_orders(mode="deploy")
 
                         new_entry_notional = entry * contracts
@@ -1066,6 +1172,9 @@ class CCXTUsdcHedgeBot:
                             contracts=contracts,
                             base_usdc_for_side=base_usdc_for_side,
                             tp_detected_at_ms=tp_detected_at_ms,
+                            target_entry_qty=captured_ct,
+                            entry_order_id=captured_entry_oid,
+                            avg_order_ids=captured_avg_oids,
                         ))
                         break
                     await asyncio.sleep(0.5)
@@ -1156,6 +1265,16 @@ class CCXTUsdcHedgeBot:
 
                 if long_contracts > self.long_contracts_prev + 1e-9 and self.long_contracts_prev > 0:
                     async with self.exec_lock:
+                        # 💡 Сохраняем orderId исполнившегося grid перед пересозданием
+                        grid_oid = self._known_grid_ids['LONG']
+                        if grid_oid:
+                            try:
+                                self.long_avg_order_ids.append(int(grid_oid))
+                                logger.info(f"📝 LONG grid orderId {grid_oid} → avg_order_ids "
+                                            f"(всего: {len(self.long_avg_order_ids)})")
+                            except (ValueError, TypeError):
+                                pass
+
                         self.long_loser_step = min(GRID_LEVELS, self.long_loser_step + 1)
                         self.long_contracts_prev = long_contracts
                         if long_pos:
@@ -1170,6 +1289,15 @@ class CCXTUsdcHedgeBot:
 
                 if short_contracts > self.short_contracts_prev + 1e-9 and self.short_contracts_prev > 0:
                     async with self.exec_lock:
+                        grid_oid = self._known_grid_ids['SHORT']
+                        if grid_oid:
+                            try:
+                                self.short_avg_order_ids.append(int(grid_oid))
+                                logger.info(f"📝 SHORT grid orderId {grid_oid} → avg_order_ids "
+                                            f"(всего: {len(self.short_avg_order_ids)})")
+                            except (ValueError, TypeError):
+                                pass
+
                         self.short_loser_step = min(GRID_LEVELS, self.short_loser_step + 1)
                         self.short_contracts_prev = short_contracts
                         if short_pos:
