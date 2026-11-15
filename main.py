@@ -20,7 +20,7 @@ SYMBOL_DISPLAY = SYMBOL_RAW.split(':')[0] if ':' in SYMBOL_RAW else SYMBOL_RAW
 LEVERAGE = int(os.getenv('LEVERAGE', 50))
 
 BASE_ORDER_USDC_LONG = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
-BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 200.0))
+BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 100.0))
 
 GRID_LEVELS = 3
 
