@@ -22,7 +22,6 @@ LEVERAGE = int(os.getenv('LEVERAGE', 50))
 BASE_ORDER_USDC_LONG = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
 BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 100.0))
 
-# 💡 Теперь 4 уровня сетки
 GRID_LEVELS = 4
 
 STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
@@ -487,7 +486,6 @@ class CCXTUsdcHedgeBot:
         if side not in ('LONG', 'SHORT'):
             logger.warning(f"⚠️ side={side} — entry_fee не считаем")
         else:
-            # ═══ ПУТЬ 1: точные orderIds (основной) ═══
             if entry_order_id > 0 or (avg_order_ids and len(avg_order_ids) > 0):
                 all_oids = []
                 if entry_order_id > 0:
@@ -508,7 +506,6 @@ class CCXTUsdcHedgeBot:
                     logger.warning(f"⚠️ userTrades по orderIds вернули 0 commission — "
                                    f"fallback walk-back")
 
-            # ═══ ПУТЬ 2: walk-back (fallback для подхваченных позиций) ═══
             if result['entry_fee'] == 0:
                 earliest_tp_ms = min(tp_times) if tp_times else int(time.time() * 1000)
                 entry_side = 'BUY' if side == 'LONG' else 'SELL'
@@ -578,7 +575,6 @@ class CCXTUsdcHedgeBot:
                 else:
                     logger.warning("⚠️ Walk-back не дал результата")
 
-            # ═══ ПУТЬ 3: оценка ═══
             if result['entry_fee'] == 0 and fallback_entry_notional > 0:
                 estimate = fallback_entry_notional * TAKER_FEE_RATE
                 result['entry_fee'] = estimate
@@ -1161,6 +1157,36 @@ class CCXTUsdcHedgeBot:
                             self.short_avg_order_ids = []
                         self.save_state()
                         success = True
+
+                        # ⚡ FIX: Sync opposite side state before deploy audit
+                        other_side = 'SHORT' if winner_side == 'LONG' else 'LONG'
+                        try:
+                            _p_now = await self.exchange.fetch_positions([SYMBOL])
+                            _o_pos = next((p for p in _p_now if p['side'] == other_side.lower() and float(p['contracts']) > 0), None)
+                            if _o_pos:
+                                _o_ct = float(_o_pos['contracts'])
+                                _o_avg = float(_o_pos['entryPrice'])
+                                _inferred = self._infer_step_from_position(_o_ct, _o_avg, other_side)
+
+                                if other_side == 'SHORT':
+                                    _curr = self.short_loser_step
+                                else:
+                                    _curr = self.long_loser_step
+
+                                if _inferred > _curr:
+                                    logger.info(f"🔄 {other_side} state auto-synced (before deploy audit): step {_curr} → {_inferred} (ct: {_o_ct})")
+                                    if other_side == 'SHORT':
+                                        self.short_loser_step = _inferred
+                                        self.short_entry_price = _o_avg
+                                        self.short_contracts_prev = _o_ct
+                                    else:
+                                        self.long_loser_step = _inferred
+                                        self.long_entry_price = _o_avg
+                                        self.long_contracts_prev = _o_ct
+                                    self.save_state()
+                        except Exception as e:
+                            logger.warning(f"⚠️ {other_side} auto-sync failed: {e}")
+                        # ⚡ END FIX
 
                         await self.audit_and_sync_all_orders(mode="deploy")
 
