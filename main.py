@@ -22,7 +22,8 @@ LEVERAGE = int(os.getenv('LEVERAGE', 50))
 BASE_ORDER_USDC_LONG = float(os.getenv('LONG_USDT_AMOUNT', 100.0))
 BASE_ORDER_USDC_SHORT = float(os.getenv('SHORT_USDT_AMOUNT', 100.0))
 
-GRID_LEVELS = 3
+# 💡 Теперь 4 уровня сетки
+GRID_LEVELS = 4
 
 STATE_FILE = os.getenv('STATE_FILE', 'bot_state.json')
 AUDIT_INTERVAL = float(os.getenv('AUDIT_INTERVAL', 30.0))
@@ -46,7 +47,9 @@ def get_grid_step_percent(step: int) -> float:
         return 10.0
     elif step == 3:
         return 15.0
-    return 15.0
+    elif step == 4:
+        return 30.0
+    return 30.0
 
 
 def get_step_usdc_volume(step: int, side: str) -> float:
@@ -57,7 +60,9 @@ def get_step_usdc_volume(step: int, side: str) -> float:
         return base * 2.0
     elif step == 3:
         return base * 4.0
-    return base * 4.0
+    elif step == 4:
+        return base * 8.0
+    return base * 8.0
 
 
 WINNER_TAKE_PROFIT_PCT = 0.5
@@ -180,10 +185,12 @@ class CCXTUsdcHedgeBot:
             return 1
         if ratio < 6.0:
             return 2
-        return 3
+        if ratio < 12.0:
+            return 3
+        return 4
 
     def _infer_initial_entry(self, avg_entry: float, step: int) -> float:
-        coef = {0: 1.0, 1: 0.9661, 2: 0.9273, 3: 0.8845}.get(step, 1.0)
+        coef = {0: 1.0, 1: 0.9661, 2: 0.9273, 3: 0.8845, 4: 0.8}.get(step, 1.0)
         return avg_entry / coef if coef > 0 else avg_entry
 
     # ============================ INIT ============================
@@ -963,8 +970,6 @@ class CCXTUsdcHedgeBot:
             short_pos = next((p for p in positions if p['side'] == 'short' and float(p['contracts']) > 0), None)
 
             if long_pos:
-                # 💡 Подхват: не трогаем entry_order_id/avg_order_ids — они из state
-                #    (если state был, orderIds сохранены; если нет — 0 → walk-back)
                 contracts = float(long_pos['contracts'])
                 avg = float(long_pos['entryPrice'])
                 inferred_step = self._infer_step_from_position(contracts, avg, 'LONG')
@@ -1094,7 +1099,6 @@ class CCXTUsdcHedgeBot:
             logger.info(f"🔍 Captured for {winner_side}: tp={captured_tp_id}, "
                         f"entry_oid={captured_entry_oid}, avg_oids={captured_avg_oids}")
 
-            # fallback_notional только от base — для случая полного отсутствия orderIds
             fallback_notional = base_usdc_for_side
 
             await self._cancel_all_orders_for_side(winner_side)
@@ -1265,7 +1269,6 @@ class CCXTUsdcHedgeBot:
 
                 if long_contracts > self.long_contracts_prev + 1e-9 and self.long_contracts_prev > 0:
                     async with self.exec_lock:
-                        # 💡 Сохраняем orderId исполнившегося grid перед пересозданием
                         grid_oid = self._known_grid_ids['LONG']
                         if grid_oid:
                             try:
