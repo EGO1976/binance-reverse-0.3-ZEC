@@ -126,7 +126,6 @@ class CCXTUsdcHedgeBot:
         self._known_grid_ids = {'LONG': None, 'SHORT': None}
         self._last_audit_time = 0.0
 
-        # 💡 Точные orderIds для расчёта entry_fee (основной путь PnL)
         self.long_entry_order_id = 0
         self.short_entry_order_id = 0
         self.long_avg_order_ids = []
@@ -1175,6 +1174,19 @@ class CCXTUsdcHedgeBot:
 
                                 if _inferred > _curr:
                                     logger.info(f"🔄 {other_side} state auto-synced (before deploy audit): step {_curr} → {_inferred} (ct: {_o_ct})")
+
+                                    # 💡 FIX: сохранить orderId исполнившегося grid в avg_order_ids
+                                    _grid_oid_now = self._known_grid_ids[other_side]
+                                    if _grid_oid_now:
+                                        try:
+                                            if other_side == 'SHORT':
+                                                self.short_avg_order_ids.append(int(_grid_oid_now))
+                                            else:
+                                                self.long_avg_order_ids.append(int(_grid_oid_now))
+                                            logger.info(f"📝 {other_side} grid orderId {_grid_oid_now} → avg_order_ids (auto-sync)")
+                                        except (ValueError, TypeError):
+                                            pass
+
                                     if other_side == 'SHORT':
                                         self.short_loser_step = _inferred
                                         self.short_entry_price = _o_avg
@@ -1184,6 +1196,14 @@ class CCXTUsdcHedgeBot:
                                         self.long_entry_price = _o_avg
                                         self.long_contracts_prev = _o_ct
                                     self.save_state()
+
+                                    # 💡 FIX: TG-уведомление об auto-detected усреднении
+                                    _icon = "🟢" if other_side == "LONG" else "🔻"
+                                    await send_tg_message(self.http_session,
+                                        f"🎯 {_icon} <b>[{SYMBOL_DISPLAY}] УСРЕДНЕНИЕ УРОВНЯ "
+                                        f"{_inferred}/{GRID_LEVELS} ВЫПОЛНЕНО!</b>\n"
+                                        f"Направление: {other_side} (auto-detected)\n"
+                                        f"Новая средняя: ${_o_avg:,.2f} | Объём: {_o_ct}")
                         except Exception as e:
                             logger.warning(f"⚠️ {other_side} auto-sync failed: {e}")
                         # ⚡ END FIX
